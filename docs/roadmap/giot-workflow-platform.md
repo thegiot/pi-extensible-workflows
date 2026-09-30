@@ -1,201 +1,74 @@
-# Epic: GIOT reusable workflow platform
+# GIOT engine lab: current experimental round
 
-## Objective
+## Purpose
 
-Evolve the fork into a reusable, capability-first workflow platform for GIOT
-while preserving the durable orchestration strengths of
-`pi-extensible-workflows` and keeping upstream synchronization practical.
+Use the public fork to test native `pi-extensible-workflows` capabilities in
+the private [giot-workflows](https://github.com/thegiot/giot-workflows) lab.
+The private repository owns workflow recipes, the harness, experiment records,
+and the overall vision. This round asks whether two workflows expose concrete
+engine API gaps. It is an experiment, not a build-platform program.
 
-The platform must support both software-factory workflows and unrelated
-workflows such as constrained travel planning.
+The existing [baseline issue](https://github.com/thegiot/giot-workflows/issues/13)
+is the context link. The current round is [epic #15](https://github.com/thegiot/pi-extensible-workflows/issues/15),
+with [diagnostics #16](https://github.com/thegiot/pi-extensible-workflows/issues/16) and
+[local Herdr #17](https://github.com/thegiot/pi-extensible-workflows/issues/17). Old issues 2–14 remain closed as moved work.
 
-## Binding principles
+## Before changing the engine
 
-- Fork conservatively; no big-bang rewrite.
-- Bun-first, Node-compatible.
-- One durable workflow engine: `pi-extensible-workflows`.
-- Effect v4 is the typed semantics layer, not a competing persistence engine.
-- Reuse `@thegiot/herdr` for Herdr 0.9.1 mechanics behind a reviewed adapter.
-- Herdr locators are not authority.
-- Model output proposes; deterministic runtime decides.
-- Capability-first kernel; domain concepts stay in adapters/recipes.
-- Preserve upstream test coverage and document intentional fork divergence.
+First run one native piewf issue-to-PR workflow in the lab and record what the
+current API supports. Record its result, then choose the next probe from observed friction.
+`plan-trip` is another conditional lab experiment; it is not required before
+an engine probe. Change the engine only for a demonstrated gap. Do not require a
+generic kernel before either workflow can run.
 
-## Planned child issues
+## Probe: external diagnostics for generated workflow code
 
-### 1. Bootstrap Bun 1.4.2 monorepo and upstream-sync policy
+Ask whether diagnostics can identify a deliberate type or property error in
+model-generated workflow code, guide an agent correction, and allow the final
+code to execute under the actual engine. Capture residual runtime errors.
 
-**Goal:** make Bun the authoritative workspace/package-manager toolchain without
-turning Pi-loaded code into Bun-only code.
+Keep the paths separate in the result:
 
-**Acceptance**
-- root declares `bun@1.4.2`;
-- deterministic `bunfig.toml` is committed;
-- install/lock strategy is documented and CI-verifiable;
-- upstream remote/sync procedure is documented;
-- inherited Node-based tests remain runnable.
+- piewf host TypeScript and Node runtime;
+- sandboxed workflow JavaScript;
+- Pi 0.99.1 `@earendil-works/pi-codemode` JavaScript in QuickJS;
+- `renderDeclarations` TypeScript output, which describes tools but does not
+  compile code or provide TypeScript/LSP diagnostics.
 
-### 2. Establish the Bun/Node/Pi runtime boundary
+Compare JavaScript using `checkJs` and JSDoc with a minimal TypeScript compile
+path. Refresh compiler versions before the probe. Existing TypeScript 7 numeric
+pins are not a version decision. Do not make the comparison select a path
+automatically.
 
-**Goal:** mechanically distinguish Bun-owned tooling/runtime from modules loaded
-inside the Pi Node host.
+## Probe: local Herdr visibility
 
-**Acceptance**
-- runtime compatibility matrix exists;
-- no accidental use of `Bun.*` in Node-hosted Pi extension graphs;
-- CI contains a Node load smoke for Pi-facing packages;
-- Bun-only packages are explicit.
+Use the existing piewf Herdr companion to check local visibility, session-node
+to-result mapping, cancellation, and cleanup. A sound result may require no
+code. If the probe proves a native gap, keep any change to one bounded patch.
 
-### 3. Introduce TypeScript 7 foundations progressively
+Herdr 0.9.1 remote `--machine` support is a separate future probe after local
+behavior is proven. Factory Herdr extraction is not a prerequisite.
 
-**Goal:** use TypeScript 7.0.2 / tsgo for GIOT-owned foundations before
-migrating inherited upstream packages.
+## Evidence and exit
 
-**Acceptance**
-- shared TS7 config exists;
-- GIOT-owned packages check with TS7;
-- upstream package migration is gated by compatibility proof;
-- no silent weakening of strictness.
+For each probe, record the repository SHA, actual dependency and tool versions,
+exact commands, outcomes, and residual errors in the private lab. State whether
+to adopt, reject, repeat, or mark the result inconclusive. No experiment has
+been run as of the documented baseline; proposed commands or expectations do
+not count as results.
 
-### 4. Integrate `@thegiot/herdr` behind a workflow adapter
+The round is complete when each probe has an evidence-backed decision or
+an explicit decision not to run it. It does
+not build an adapter, Effect layer, generic kernel, remote runner, multi-issue
+scheduler, dynamic architect, marketplace, or Factory Herdr integration. Link
+later work to the decision that establishes its need. Preserve the Node.js
+`>=22.19.0` baseline and existing npm workspace and lockfile contracts while
+probing.
 
-**Goal:** eliminate duplicate Herdr mechanics while preserving workflow-specific
-handoff/inspection semantics.
+## Upstream
 
-**Important constraint:** `@thegiot/herdr` currently declares a Bun-only
-runtime contract, while the Pi Herdr extension is Node-hosted.
-
-**Acceptance**
-- reviewed compatibility design chooses either a Node-compatible client core +
-  optional Bun transport, or a typed Bun-side bridge;
-- workflow Herdr semantics depend on an interface, not CLI string construction;
-- Herdr pane/workspace identity never grants domain authority;
-- live handoff, inspection, cancellation and cleanup remain covered.
-
-### 5. Add Effect v4 integration layer without a second workflow engine
-
-**Goal:** provide Effect-backed services, errors, schemas, retries and resource
-safety to workflow functions.
-
-**Acceptance**
-- Effect `Schema` can define workflow input/output and derive JSON Schema;
-- typed errors map cleanly to workflow failures;
-- `Context`/`Layer` expose deterministic services;
-- `Schedule`/scopes/interruption are usable;
-- persistence/resume/checkpoint ownership remains with piewf.
-
-### 6. Define the capability-first workflow kernel
-
-**Goal:** establish a small domain-neutral algebra rather than a library of
-domain scripts.
-
-Candidate capabilities:
-- research/search/fetch;
-- agent;
-- parallel/pipeline;
-- review;
-- verification;
-- approval/checkpoint;
-- budget;
-- artifact;
-- isolated workspace;
-- publication;
-- clock/human interaction.
-
-**Acceptance**
-- domain entities such as GitHub issues, PRs, hotels and flights do not enter
-  the kernel;
-- candidate/gate semantics embody “model proposes; runtime decides”;
-- APIs are typed and composable.
-
-### 7. Add generic role/model routing on Pi 0.99 virtual models
-
-**Goal:** keep workflow roles independent from concrete providers/models.
-
-**Acceptance**
-- roles request capability/quality/cost intent;
-- virtual model aliases resolve to configured physical targets;
-- routing policy can change without editing recipes;
-- strong review floors and economical coordinator policies can be expressed
-  without GIOT-specific hardcoding in core.
-
-### 8. Extract reusable workflow primitives
-
-**Goal:** implement the first stable primitives used by larger compositions.
-
-Initial set:
-- `research`;
-- `agent`;
-- `review`;
-- `verify`;
-- `checkpoint`;
-- `budget`;
-- `artifact`;
-- `withWorkspace`.
-
-**Acceptance**
-- each primitive has typed IO/error contracts;
-- primitives compose through the existing durable runtime;
-- no primitive assumes a software domain.
-
-### 9. Implement `develop-issue` recipe
-
-**Goal:** express a single software issue delivery using the generic kernel.
-
-Expected composition:
-load source → derive contract → isolate workspace → implement → verify → review
-→ produce/publish candidate.
-
-**Acceptance**
-- issue/Git/GitHub concepts live in the software adapter/recipe;
-- deterministic gates own completion/publication;
-- writer/reviewer authority is explicit;
-- worktree lifecycle is deterministic and tested.
-
-### 10. Implement `develop-issues` parallel composition
-
-**Goal:** replace the prototype-style `develop-issues.ts` composition with a
-typed reusable composition.
-
-**Acceptance**
-- multiple issue recipes run with bounded concurrency;
-- failure of one child does not implicitly authorize merge/publication of it;
-- approved candidates are combined through deterministic integration gates;
-- durable resume does not rerun completed children unnecessarily.
-
-### 11. Implement `plan-trip` non-software vertical slice
-
-**Goal:** prove the kernel is genuinely generic.
-
-Input should cover at least dates, origin/destination and budget. The workflow
-should research transport/lodging/activities, enforce constraints, review the
-candidate, and produce an itinerary artifact.
-
-**Acceptance**
-- uses the same generic primitives as software recipes;
-- no travel-specific changes are required in the kernel;
-- budget/constraint checks are deterministic where data permits;
-- provenance for researched facts is retained.
-
-### 12. Dogfood from `giot-factory` and assess Epic migration
-
-**Goal:** integrate the new platform with GIOT rather than creating a parallel
-unused framework.
-
-**Acceptance**
-- at least one bounded GIOT workflow runs through the new packages;
-- compare current issue/epic orchestration with the new composition model;
-- identify which current `pi-issue-*` / `pi-epic-*` responsibilities can
-  migrate and which remain GIOT policy;
-- no migration occurs solely to reduce file count: authority/evidence
-  invariants must be preserved or strengthened.
-
-## Epic exit criteria
-
-- upstream sync remains repeatable;
-- Bun workspace is authoritative without breaking Pi/Node compatibility;
-- `@thegiot/herdr` is reused safely;
-- Effect is usable without duplicate durable state;
-- `develop-issue`, `develop-issues`, and `plan-trip` share the same kernel;
-- GIOT dogfood demonstrates a credible path toward simplifying current Epic
-  orchestration.
+The fork baseline is `8fbd9aa5501ad4899a39e396090222c89df5ed78`; the recorded
+upstream baseline is `c90e2451fbc03cec944d945cf154e0314bffeaaf`. These are
+reference commits, not latest-version claims. Sync by inspecting upstream
+changes and carrying isolated fork patches on a reviewed branch. Do not
+wholesale-reset the fork or broadly port changes without a demonstrated gap.
