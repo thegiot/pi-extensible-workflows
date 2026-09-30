@@ -4,6 +4,7 @@
   "private": true,
   "description": "Workspace orchestrator for pi-extensible-workflows",
   "type": "module",
+  "packageManager": "bun@1.4.2",
   "workspaces": [
     "packages/cli",
     "packages/core",
@@ -37,7 +38,8 @@
     "prepack": "npm run build"
   },
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "bun": ">=1.4.2"
   },
   "license": "MIT"
 }
