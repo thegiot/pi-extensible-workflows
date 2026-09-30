@@ -1,0 +1,17 @@
+# GIOT fork runtime/package-manager policy.
+# Bun owns install/workspace orchestration, while Pi-loaded packages remain
+# Node-compatible until the dedicated runtime-boundary migration lands.
+[install]
+registry = "https://registry.npmjs.org"
+linker = "isolated"
+globalStore = true
+auto = "disable"
+exact = true
+
+[run]
+# Do not alias node to Bun inside package scripts. Pi remains a Node host.
+bun = false
+noOrphans = true
+
+[test]
+retry = 0
