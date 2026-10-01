@@ -4,6 +4,35 @@ Pi extensions and a CLI for deterministic, resumable multi-agent workflows,
 standalone subagents, and run inspection. This is an npm-workspaces TypeScript
 repository, not a hosted application.
 
+## GIOT fork task guidance
+
+This public fork is an engine lab for native `pi-extensible-workflows` API gaps
+found while dogfooding in the private [giot-workflows](https://github.com/thegiot/giot-workflows)
+repository. GIOT owns recipes, the experiment harness, experiment evidence, and
+the overall product direction. Keep this repository focused on changes to the
+engine that a recipe cannot express with its current native API. Start by
+proving one native issue-to-PR workflow in the lab, record its result, then choose a probe from the observed friction. `plan-trip`
+is another conditional lab experiment; it is not required before an engine probe.
+
+The current experimental round has two probes: external diagnostics and agent
+correction for generated workflow code, and local Herdr session visibility,
+result mapping, cancellation, and cleanup. Record the repository SHA, actual
+tool versions, exact commands, outcomes, residual errors, and a decision to
+adopt, reject, repeat, or mark inconclusive in the private repository. Proposed
+tests are not evidence. Read the [current engine epic #15](https://github.com/thegiot/pi-extensible-workflows/issues/15)
+and the live requested issue before work. The probes are [diagnostics #16](https://github.com/thegiot/pi-extensible-workflows/issues/16)
+and [local Herdr #17](https://github.com/thegiot/pi-extensible-workflows/issues/17), gated by the lab's
+[baseline issue](https://github.com/thegiot/giot-workflows/issues/13).
+
+Preserve the Node.js `>=22.19.0` baseline and the checked-in npm workspace and
+lockfile contracts. Treat the existing Bun package metadata as inherited state,
+not evidence that this fork is becoming Bun-first. Refresh compiler and tooling
+versions before proposing them; do not carry forward unsupported version pins.
+Keep upstream changes narrow and reviewable. Inspect upstream changes and
+preserve fork patches during sync; never replace the fork wholesale. The
+existing runtime, security, recovery, cancellation, and verification rules
+below continue to apply.
+
 ## Code map
 
 - `packages/core/src/host.ts`: Pi workflow tool entry point; `host-*.ts`: lifecycle, recovery, delivery, and TUI.

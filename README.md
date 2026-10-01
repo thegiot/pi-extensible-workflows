@@ -2,6 +2,18 @@
 
 Deterministic, resumable multi-agent workflow orchestration for Pi.
 
+## GIOT fork
+
+This fork is a small engine lab for native piewf API gaps found while building
+GIOT workflows. Recipes, the experiment harness, and evidence live in the
+private [giot-workflows](https://github.com/thegiot/giot-workflows) repository.
+The current round checks external diagnostics for generated workflow code and
+local Herdr session visibility. See the [baseline issue](https://github.com/thegiot/giot-workflows/issues/13),
+[current direction](docs/giot-architecture.md) and
+[engine roadmap](docs/roadmap/giot-workflow-platform.md).
+Upstream remains the source for general engine behavior; fork changes need a
+specific native API gap and should stay easy to sync.
+
 <p align="center">
   <img src="assets/banner.svg" alt="Animated workflow: a task fans out to parallel agents, merges into review, and either completes or loops back" width="100%">
 </p>

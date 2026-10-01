@@ -1,136 +1,83 @@
-# GIOT workflow fork architecture
+# GIOT engine lab
 
-This fork evolves `vekexasia/pi-extensible-workflows` into a reusable workflow
-platform for GIOT while keeping upstream synchronization practical.
+This public fork answers a narrow question: which changes, if any, does
+GIOT need in the native `pi-extensible-workflows` engine? The private
+[giot-workflows](https://github.com/thegiot/giot-workflows) repository owns
+recipes, the test harness, experiment evidence, and the broader product plan.
+This fork changes only when a proven workflow cannot be expressed through the
+engine's existing API.
 
-## Goals
+## Current baseline
 
-- Keep the durable workflow runtime, resume/checkpoint/budget semantics, agent
-  lifecycle, roles, worktrees, and trajectory facilities inherited from
-  `pi-extensible-workflows`.
-- Use Bun 1.4.2 as the monorepo package manager and orchestration runtime for
-  GIOT-owned packages and tooling.
-- Keep code loaded directly by Pi compatible with the Node host used by Pi
-  0.99.1. Bun ownership must not be inferred merely because Bun manages the
-  monorepo.
-- Introduce TypeScript 7 and Effect v4 progressively without creating a second
-  workflow engine.
-- Reuse `@thegiot/herdr` for Herdr 0.9.1 protocol/process mechanics behind a
-  workflow-specific adapter.
-- Build small composable workflow capabilities that can express both software
-  delivery workflows and unrelated domains such as travel planning.
+- Fork baseline: `8fbd9aa5501ad4899a39e396090222c89df5ed78`.
+- Upstream reference: `vekexasia/pi-extensible-workflows` 5.18.0 at
+  `c90e2451fbc03cec944d945cf154e0314bffeaaf`. These are recorded baselines,
+  not claims about the latest upstream release.
+- Runtime baseline: Node.js `>=22.19.0`, as declared in the package manifest.
+  The repository uses npm workspace scripts and a checked-in npm lockfile.
+  Existing Bun package metadata does not set the direction for this experiment.
+- First prove a native piewf issue-to-PR workflow in the lab. Record
+  its result, then choose a probe from the observed friction. `plan-trip` is
+  another conditional lab experiment, not a gate before an engine probe.
 
-## Non-goals
+The [parent baseline issue](https://github.com/thegiot/giot-workflows/issues/13)
+tracks the private lab context. The current engine round is
+[epic #15](https://github.com/thegiot/pi-extensible-workflows/issues/15), with
+[diagnostics #16](https://github.com/thegiot/pi-extensible-workflows/issues/16) and
+[local Herdr #17](https://github.com/thegiot/pi-extensible-workflows/issues/17). Old issues 2–14 remain closed as
+moved work; they are not a live implementation backlog.
 
-- No big-bang rewrite of the upstream core.
-- No duplicate persistence/resume engine in Effect.
-- No domain-specific concepts such as GitHub issues, pull requests, hotels, or
-  flights in the generic kernel.
-- No Herdr pane/workspace identity as execution or mutation authority.
+## Current experimental round
 
-## Runtime boundary
+### External diagnostics for generated workflow code
 
-```text
-Bun 1.4.2 monorepo/tooling
-        |
-        +-- GIOT deterministic services (Effect v4 / TS7)
-        |
-        +-- workflow recipes
-        |
-        +-- Pi workflow adapter --------------------+
-                                                    |
-                                             Pi 0.99.1 / Node host
-                                                    |
-                                      pi-extensible-workflows runtime
-                                                    |
-                                      workflow <-> Herdr adapter
-                                                    |
-                                           @thegiot/herdr
-                                                    |
-                                             Herdr 0.9.1
-```
+Test whether model-generated workflow code can receive useful external
+diagnostics, let an agent correct an intentional type or property error, and
+then execute the corrected code with the actual engine. Report any remaining
+runtime errors.
 
-The existing `@thegiot/herdr` package currently declares a Bun-only runtime
-contract. The integration must therefore establish a reviewed compatibility
-boundary before the Pi extension imports it directly. Acceptable outcomes are:
+Keep the runtimes distinct in the evidence:
 
-1. split the package into a Node-compatible protocol/client core plus an
-   optional Bun transport, or
-2. keep a Bun-side bridge/adaptor and communicate through a typed boundary.
+- piewf itself is hosted by Pi's TypeScript/Node path;
+- workflow bodies run as sandboxed JavaScript;
+- Pi 0.99.1 `@earendil-works/pi-codemode` runs JavaScript in QuickJS;
+- its `renderDeclarations` output describes tools in TypeScript, but does not
+  compile workflow code or provide LSP diagnostics.
 
-The fork must not silently load Bun-only APIs inside a Node-hosted Pi extension.
+Compare JavaScript with `checkJs` and JSDoc against a minimal TypeScript
+compile-and-run path. Refresh compiler and tooling versions before choosing
+one; do not inherit unsupported TypeScript 7 numeric pins. The probe compares
+options and does not choose automatically.
 
-## Ownership model
+### Local Herdr session visibility
 
-The platform follows one invariant:
+Check whether the existing piewf Herdr companion provides local visibility,
+maps a session node to its result, and handles cancellation and cleanup. The
+probe may conclude that no code change is needed, or identify one bounded patch
+to a demonstrated native gap.
 
-> Model output proposes; deterministic runtime decides.
+Prove the local flow first. Herdr 0.9.1 remote `--machine` support is a
+separate future probe. Extracting Factory's Herdr integration is not a
+prerequisite.
 
-Agents may produce candidates, plans, findings, or recommendations. They do not
-grant completion, publication, mutation, or authority by prose. Deterministic
-runtime gates validate evidence and own state transitions.
+## Evidence and decisions
 
-Herdr supplies runtime mechanics and locators only. A pane, tab, workspace, or
-agent name never grants domain authority.
+For each probe, record the tested repository SHA, actual tool versions, exact
+commands, results, residual errors, and one decision: adopt, reject, repeat,
+or inconclusive. No experiment has been run as of these recorded baselines.
+Proposals and documentation do not count as execution evidence.
 
-## Effect v4 role
+The round ends with those decisions. It does not require an adapter, generic
+kernel, Effect layer, remote execution, multi-issue scheduler, dynamic
+architect, marketplace, or Factory Herdr extraction. Revisit those topics only
+when a linked workflow establishes a concrete need.
 
-Effect is used for typed program semantics:
+## Upstream sync
 
-- `Schema` for input/output and JSON Schema derivation;
-- typed error channels;
-- `Context` / `Layer` for services;
-- `Schedule` for retries/backoff;
-- scopes/finalizers for resource safety;
-- structured concurrency and interruption;
-- test services and deterministic clocks.
-
-The durable workflow lifecycle remains owned by `pi-extensible-workflows`.
-Effect must not introduce competing resume/checkpoint/persistence semantics.
-
-## Capability-first workflow surface
-
-The reusable layer should converge on capabilities such as:
-
-- research / search / fetch;
-- agent execution;
-- parallel / pipeline composition;
-- review;
-- verification;
-- approval / checkpoint;
-- budget;
-- artifact production;
-- isolated workspace;
-- publication;
-- clock / human interaction.
-
-Domain packages adapt those capabilities:
-
-```text
-software: GitHubIssueSource, GitWorktreeWorkspace, TestVerification, PRPublication
-travel:   FlightSearch, HotelSearch, MapSearch, TravelBudgetVerification
-```
-
-## Validation strategy
-
-Two deliberately different vertical slices are required before generalizing an
-Epic-like scheduler:
-
-1. `develop-issue` / `develop-issues`;
-2. `plan-trip`.
-
-If both can be expressed without adding domain conditionals to the kernel, the
-abstraction level is considered viable.
-
-## Upstream policy
-
-Changes to inherited upstream code should be minimized and isolated. Prefer new
-GIOT packages/adapters over broad edits to upstream core. Every architectural
-change should state whether it is:
-
-- upstream-compatible and potentially upstreamable;
-- GIOT-specific adapter/policy;
-- temporary fork divergence.
-
-The fork should retain a documented upstream remote and a repeatable upstream
-sync procedure.
+The fork is based on upstream commit
+`c90e2451fbc03cec944d945cf154e0314bffeaaf`; it is not assumed to be current.
+Before syncing, inspect upstream history and the diff against the fork. Carry
+isolated fork patches forward on a reviewed branch and run the checks relevant
+to those changes. Do not wholesale-reset or broadly port upstream changes.
+Keep every divergence tied to an observed native API gap and its private lab
+evidence.
