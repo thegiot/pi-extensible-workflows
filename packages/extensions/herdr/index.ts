@@ -22,6 +22,7 @@ import {
   openHerdrLivePane,
   waitForHerdrPane,
   registerWorkflowExtension,
+  WorkflowError,
   workflowSettingsPath,
 } from "pi-extensible-workflows";
 import type {
@@ -66,7 +67,7 @@ type HerdrCommandResult = Awaited<ReturnType<typeof openHerdrLivePane>>;
 type ToolBridgeRequest = { toolCallId: string; name: string; params: unknown };
 type LifecycleBridgeRequest = { type: "agent_settled" };
 type ToolBridgeMessage = { type: "update"; value: unknown } | { type: "error"; error: string } | { type: "result"; value: unknown } | { type: "ack" };
-type WorkspaceManager = { open(run: Readonly<WorkflowRunContext>, request: HerdrWorkspacePaneRequest): Promise<HerdrWorkspacePane>; close(runId: string): Promise<void>; closeAll(): Promise<void> };
+type WorkspaceManager = { open(run: Readonly<WorkflowRunContext>, request: HerdrWorkspacePaneRequest): Promise<HerdrWorkspacePane>; close(runId: string): Promise<void>; closeAll(): Promise<void>; flush(): Promise<void> };
 type LaunchPaneOptions = { session: HerdrSession; prepared: Readonly<PreparedAgentSession>; identity: Readonly<AgentIdentity>; run?: Readonly<WorkflowRunContext> | undefined; attempt: number; runner: HerdrCommandRunner; fullyInspectable: boolean; env: NodeJS.ProcessEnv; signal: AbortSignal; prompt?: string | undefined; workspaces?: WorkspaceManager | undefined; tuiIndex?: number | undefined; tuiLabel?: string | undefined; directPrompt?: boolean | undefined; onStatus?: ((state: HerdrAgentStatus) => void | Promise<void>) | undefined };
 type PaneHandle = { pane: string; monitor: Promise<"closed" | "exited" | "idle" | "settled" | "aborted">; reporter: HerdrAgentReporter; closeRemote(): Promise<void>; close(): Promise<void> };
 type HerdrBreadcrumbIdentity = Omit<AgentIdentity, "structuralPath"> & { structuralPath?: readonly string[] };
@@ -312,8 +313,25 @@ function workspacePane(value: HerdrCommandResult): HerdrWorkspacePane {
   return value;
 }
 
-function createWorkflowWorkspaces(runner: HerdrCommandRunner): WorkspaceManager {
+export function createWorkflowWorkspaces(runner: HerdrCommandRunner): WorkspaceManager {
   const workspaces = new Map<string, Promise<string>>();
+  const pendingCloses = new Set<Promise<void>>();
+  let holdExit: NodeJS.Timeout | undefined;
+  const releaseExitHold = (): void => {
+    if (pendingCloses.size > 0) return;
+    if (holdExit) { clearInterval(holdExit); holdExit = undefined; }
+  };
+  const trackClose = (close: Promise<void>): void => {
+    // A terminal close is delivered fire-and-forget from run events, and the headless CLI
+    // drains its event loop immediately after completion, so an unheld close races process
+    // exit and often never lands (every probe run leaked its workspace container). Hold the
+    // loop until the close settles, capped so a hung `herdr` CLI cannot wedge the host.
+    const capped = new Promise<void>((resolve) => { const timer = setTimeout(resolve, 10_000); timer.unref(); });
+    const settled = Promise.race([close, capped]);
+    pendingCloses.add(settled);
+    holdExit ??= setInterval(() => {}, 50);
+    void settled.catch(() => undefined).finally(() => { pendingCloses.delete(settled); releaseExitHold(); });
+  };
   return {
     async open(run: Readonly<WorkflowRunContext>, request: HerdrWorkspacePaneRequest): Promise<HerdrWorkspacePane> {
       const existing = workspaces.get(run.runId);
@@ -329,9 +347,13 @@ function createWorkflowWorkspaces(runner: HerdrCommandRunner): WorkspaceManager 
     async close(runId: string): Promise<void> {
       const workspace = workspaces.get(runId);
       workspaces.delete(runId);
-      if (workspace) await workspace.then((id) => runner(["workspace", "close", id])).catch(() => undefined);
+      if (!workspace) return;
+      const close = workspace.then(async (id) => { await runner(["workspace", "close", id]); }).catch(() => undefined);
+      trackClose(close);
+      await close;
     },
     async closeAll(): Promise<void> { await Promise.all([...workspaces.keys()].map((runId) => this.close(runId))); },
+    async flush(): Promise<void> { await Promise.allSettled([...pendingCloses]); },
   };
 }
 
@@ -461,10 +483,11 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
           active = current;
           let monitorFailed = false;
           let monitorError: unknown;
+          let monitorReason: "closed" | "exited" | "idle" | "settled" | "aborted" | undefined;
           let resumeFailed = false;
           let resumeError: unknown;
           try {
-            await current.monitor;
+            monitorReason = await current.monitor;
           } catch (error) {
             monitorFailed = true;
             monitorError = error;
@@ -478,6 +501,12 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
           let assistant = session.getLastAssistant?.();
           const resultTool = prepared.resultTool;
           const resultSubmitted = resultTool !== undefined && hasNamedToolCall(assistant, resultTool.name);
+          if ((monitorReason === "closed" || monitorReason === "exited" || monitorReason === "aborted") && !resultSubmitted && needsContinuation(assistant)) {
+            // The pane died before the turn settled. Continuing locally would silently re-run
+            // the remaining task (the probe's excess billing) and left hosts hung on the stale
+            // handoff session; fail the attempt so the run reaches a terminal state promptly.
+            throw new WorkflowError("AGENT_FAILED", `Herdr agent pane was ${monitorReason} before the turn settled; the agent attempt ended without a result.`);
+          }
           const incomplete = needsContinuation(assistant);
           if (!resultSubmitted && incomplete) {
             await session.prompt("Continue the task from the current session state.");

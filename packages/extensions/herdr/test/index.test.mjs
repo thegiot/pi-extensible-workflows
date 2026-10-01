@@ -7,8 +7,11 @@ import { pathToFileURL } from "node:url";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import extension, { breadcrumbLabel, createHerdrExtension, isFullyInspectableMode } from "../dist/index.js";
-import { WORKFLOW_BLOCKED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, createLiveSessionHandoff, loadingRegistry, localAgentTransport, resetWorkflowRegistry } from "pi-extensible-workflows";
+import extension, { breadcrumbLabel, createHerdrExtension, createWorkflowWorkspaces, isFullyInspectableMode } from "../dist/index.js";
+import { WORKFLOW_BLOCKED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, createLiveSessionHandoff, loadingRegistry, localAgentTransport, resetWorkflowRegistry, WorkflowError } from "pi-extensible-workflows";
+
+// Issue #22: a pane that dies before the turn settles must fail the attempt, not continue locally.
+const isPaneLost = (error) => error instanceof WorkflowError && error.code === "AGENT_FAILED";
 
 const piRuntime = { executable: process.execPath, entrypoint: "/originating/pi-coding-agent/dist/cli.js" };
 function writeFixtureStream(res, id = "fixture") {
@@ -589,8 +592,9 @@ void test("clears the active pane after a failed pane monitor so the next prompt
     // First prompt: pane monitoring fails; active must still be cleared
     await assert.rejects(session.prompt("first"), (error) => error instanceof Error && error.message === "Herdr pane did not start Pi.");
     assert.equal(paneRuns, 1, "initial pane only");
-    // Second prompt: must launch a new pane (pane-2) since active was cleared despite failed resume
-    await session.prompt("second");
+    // Second prompt: must launch a new pane (pane-2) since active was cleared despite failed resume.
+    // The pane then dies before settling: the attempt fails (issue #22) instead of continuing locally.
+    await assert.rejects(session.prompt("second"), isPaneLost);
     assert.equal(paneRuns, 2, "a new pane should open for the second prompt");
   } finally {
     await Promise.allSettled([session?.dispose()]);
@@ -634,7 +638,9 @@ void test("concurrent prompts join an in-flight pane launch rather than opening 
     fixture = await createFixtureModel(agentDir);
     const prepared = { cwd: root, agentDir, model: { provider: "fixture", model: "fixture-model" }, tools: [], initialPrompt: "initial", sessionLabel: "flow:review", piRuntime };
     session = await agent.transport.createSession(prepared, { ...context, attempt: 1 });
-    await session.prompt("first");
+    // First prompt: pane-1 dies before settling, so the attempt fails (issue #22)…
+    await assert.rejects(session.prompt("first"), isPaneLost);
+    // …and the follow-up prompts must join ONE replacement launch rather than opening a second.
     second = session.prompt("second");
     third = session.prompt("third");
     while (paneRuns < 2) await new Promise((resolve) => globalThis.setImmediate(resolve));
@@ -642,8 +648,10 @@ void test("concurrent prompts join an in-flight pane launch rather than opening 
     for (let i = 0; i < 5; i++) await new Promise((resolve) => globalThis.setImmediate(resolve));
     assert.equal(paneRuns, 2, "only one new pane should be opened for concurrent prompts");
     releaseLaunch();
-    await Promise.all([second, third]);
+    const outcomes = await Promise.allSettled([second, third]);
     assert.equal(paneRuns, 2, "only one new pane should be opened for concurrent prompts");
+    // The replacement pane also dies before settling: both joined prompts fail the attempt.
+    assert.ok(outcomes.every((outcome) => outcome.status === "rejected" && isPaneLost(outcome.reason)), `joined prompts must fail as pane-lost: ${JSON.stringify(outcomes.map(({ status, reason }) => ({ status, code: reason?.code })))}`);
   } finally {
     releaseLaunch?.();
     await Promise.allSettled([second ?? Promise.resolve(), third ?? Promise.resolve(), session?.dispose()]);
@@ -721,7 +729,8 @@ void test("serializes one replacement launch after a shared launch failure", { t
   try {
     fixture = await createFixtureModel(agentDir);
     session = await agent.transport.createSession({ cwd: root, agentDir, model: { provider: "fixture", model: "fixture-model" }, tools: [], initialPrompt: "initial", sessionLabel: "flow:review", piRuntime }, { ...context, attempt: 1 });
-    await session.prompt("first");
+    // First prompt: pane-1 dies before settling → the attempt fails (issue #22).
+    await assert.rejects(session.prompt("first"), isPaneLost);
     second = session.prompt("second");
     third = session.prompt("third");
     fourth = session.prompt("fourth");
@@ -732,8 +741,10 @@ void test("serializes one replacement launch after a shared launch failure", { t
     await new Promise((resolve) => globalThis.setTimeout(resolve, 50));
     assert.equal(paneRuns, 3, "one failed launch and one shared retry");
     releaseLaunch();
-    await Promise.allSettled([second, third, fourth]);
+    const outcomes = await Promise.allSettled([second, third, fourth]);
     assert.equal(paneRuns, 3, "concurrent prompts must share the replacement launch");
+    // The replacement pane also dies before settling: all joined prompts fail as pane-lost.
+    assert.ok(outcomes.every((outcome) => outcome.status === "rejected" && isPaneLost(outcome.reason)), `joined prompts must fail as pane-lost: ${JSON.stringify(outcomes.map(({ status, reason }) => ({ status, code: reason?.code })))}`);
   } finally {
     releaseLaunch?.();
     await Promise.allSettled([second ?? Promise.resolve(), third ?? Promise.resolve(), fourth ?? Promise.resolve(), session?.dispose()]);
@@ -778,7 +789,8 @@ void test("does not launch a replacement after Herdr disposal starts", { timeout
   try {
     fixture = await createFixtureModel(agentDir);
     session = await agent.transport.createSession({ cwd: root, agentDir, model: { provider: "fixture", model: "fixture-model" }, tools: [], extensionFactories: [extensionFactory], initialPrompt: "initial", sessionLabel: "flow:review", piRuntime }, { ...context, attempt: 1 });
-    await session.prompt("first");
+    // First prompt: pane-1 dies before settling → the attempt fails (issue #22).
+    await assert.rejects(session.prompt("first"), isPaneLost);
     second = session.prompt("second");
     third = session.prompt("third");
     fourth = session.prompt("fourth");
@@ -851,7 +863,8 @@ void test("disposes a Herdr wrapper while a subsequent pane is still launching",
   extension.agentSetupHooks.fullyInspectable.setup(agent, context);
   const prepared = { cwd, agentDir, model: { provider: "fixture", model: "fixture-model" }, tools: [], extensionFactories: [extensionFactory], initialPrompt: "initial", sessionLabel: "flow:review", piRuntime };
   session = await agent.transport.createSession(prepared, { ...context, attempt: 1 });
-  await session.prompt("first");
+  // First prompt: pane-1 dies before settling → the attempt fails (issue #22).
+  await assert.rejects(session.prompt("first"), isPaneLost);
   pending = session.prompt("second");
   while (paneRuns < 2) await new Promise((resolve) => globalThis.setImmediate(resolve));
   const disposal = session.dispose();
@@ -1343,4 +1356,70 @@ void test("bridges a custom tool with a model supplied only by an inline extensi
     await session.dispose();
     await rm(root, { recursive: true, force: true });
   }
+});
+void test("fails the attempt when the agent pane is closed mid-turn instead of continuing locally", { timeout: 30_000 }, async () => {
+  // Issue #22 regression (cancellation hang + excess billing): force-closing the streaming
+  // agent pane used to resolve prompt() via a silent local "Continue the task…" generation
+  // against the stale handoff session — the hung probe leg billed ~2.4x a normal run and the
+  // host never reached a terminal state. The attempt must fail instead.
+  const root = mkdtempSync(join(tmpdir(), "herdr-pane-close-cancel-"));
+  const agentDir = join(root, "agent");
+  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  writeFileSync(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ extensionSettings: { herdr: { enableFullyInspectableMode: true } } }));
+  let paneRuns = 0;
+  let closePoll = 0;
+  const runner = async (args) => {
+    if (args[0] === "workspace" && args[1] === "create") return JSON.stringify({ result: { workspace: { workspace_id: "ws" }, tab: { tab_id: "tab-root" }, root_pane: { pane_id: "pane-root" } } });
+    if (args[0] === "tab" && args[1] === "create") return JSON.stringify({ result: { tab: { tab_id: "tab-1" }, root_pane: { pane_id: "pane-1" } } });
+    if (args[0] === "pane" && args[1] === "run") { paneRuns += 1; return ""; }
+    if (args[0] === "pane" && args[1] === "process-info") {
+      // First poll: Pi is streaming in the pane. Second poll: the pane was closed (like
+      // `herdr pane close`) — the runner errors, which waitForHerdrPane classifies as "closed".
+      closePoll += 1;
+      if (closePoll === 1) return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } });
+      throw new Error("pane not found");
+    }
+    return "";
+  };
+  const extension = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "parent" }, runner });
+  const agent = { transport: localAgentTransport };
+  const context = { identity: { structuralPath: ["review"], parentBreadcrumb: "flow", callSite: "agent", occurrence: 1 }, run: { runId: "run", workflow: { name: "flow" } }, signal: new AbortController().signal };
+  extension.agentSetupHooks.fullyInspectable.setup(agent, context);
+  let fixture;
+  let session;
+  try {
+    fixture = await createFixtureModel(agentDir);
+    const prepared = { cwd: root, agentDir, model: { provider: "fixture", model: "fixture-model" }, tools: [], initialPrompt: "initial", sessionLabel: "flow:review", piRuntime };
+    session = await agent.transport.createSession(prepared, { ...context, attempt: 1 });
+    await assert.rejects(session.prompt("first"), isPaneLost);
+    assert.equal(paneRuns, 1, "no silent local continuation may relaunch or regenerate");
+  } finally {
+    await Promise.allSettled([session?.dispose()]);
+    await fixture?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+void test("workspace manager tracks terminal closes so they survive headless exit", async () => {
+  // Issue #22 regression (workspace leak): terminal closes are delivered fire-and-forget and
+  // the headless CLI drains its event loop immediately after completion, so unheld closes
+  // raced process exit and leaked the container on every probe run. The manager now tracks
+  // pending closes (holding the loop, capped) and exposes flush() for deterministic teardown.
+  const calls = [];
+  const runner = async (args) => {
+    calls.push([...args]);
+    if (args[0] === "workspace" && args[1] === "create") return JSON.stringify({ result: { workspace: { workspace_id: "ws-leak" }, tab: { tab_id: "tab-root" }, root_pane: { pane_id: "pane-root" } } });
+    if (args[0] === "tab" && args[1] === "rename") return "";
+    if (args[0] === "tab" && args[1] === "create") return JSON.stringify({ result: { tab: { tab_id: "tab-1" }, root_pane: { pane_id: "pane-1" } } });
+    if (args[0] === "pane" && args[1] === "run") return "";
+    return "";
+  };
+  const workspaces = createWorkflowWorkspaces(runner);
+  await workspaces.open({ runId: "run-leak", workflow: { name: "flow" } }, { cwd: process.cwd(), tabLabel: "#1 developer", command: "echo hi" });
+  await workspaces.close("run-leak");
+  await workspaces.flush();
+  assert.ok(calls.some(([command, subcommand, id]) => command === "workspace" && subcommand === "close" && id === "ws-leak"), `terminal close must reach the herdr CLI: ${JSON.stringify(calls)}`);
+  // A second close for an already-closed run is a no-op (no duplicate CLI call).
+  await workspaces.close("run-leak");
+  await workspaces.flush();
+  assert.equal(calls.filter(([command, subcommand]) => command === "workspace" && subcommand === "close").length, 1, "close must be issued exactly once per run");
 });
