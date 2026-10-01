@@ -117,8 +117,26 @@ void test("navigator reviews each pending checkpoint before answering", async ()
   assert.equal(selectCalls, 3);
   assert.equal(customCalls, 5);
   assert.equal(pendingAfterCancel, 1);
-  assert.deepEqual(await store.replay("checkpoint/first"), { path: "checkpoint/first", value: true });
-  assert.deepEqual(await store.replay("checkpoint/second"), { path: "checkpoint/second", value: false });
+  assert.deepEqual(await store.replay("checkpoint/first"), {
+    path: "checkpoint/first",
+    value: true,
+    checkpoint: {
+      name: "first",
+      prompt: "Review the first artifact?",
+      context: { artifact: "object", entries: Array.from({ length: 80 }, (_, index) => `entry-${String(index)}`), marker: "OBJECT_CONTEXT_END" },
+      provenance: "interactive",
+    },
+  });
+  assert.deepEqual(await store.replay("checkpoint/second"), {
+    path: "checkpoint/second",
+    value: false,
+    checkpoint: {
+      name: "second",
+      prompt: "Review the second artifact?",
+      context: null,
+      provenance: "interactive",
+    },
+  });
   assert.deepEqual(await store.awaitingCheckpoints(), []);
   assert.deepEqual(notices, []);
 });

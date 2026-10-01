@@ -408,11 +408,11 @@ void test("replays completed agent, shell, and checkpoint operations across rest
   await child.create({ id: "run-b", workflowName: "x", cwd, sessionId: "session-a", state: "failed", parentRunId: "run-a", retry: { sourceRunId: "run-a", lineageRootRunId: "run-a", completedPaths: [agentPath, shellPath, checkpoint.path], incompletePaths: ["agent/parallel/bad"], namedWorktrees: [] }, agents: [], agentSessions: [] }, snapshot);
   const reloadedChild = new RunStore(cwd, "session-a", "run-b", home);
   const inherited = [
-    [agentPath, "done"],
-    [shellPath, { exitCode: 0, stdout: "ok", stderr: "" }],
-    [checkpoint.path, true],
+    { path: agentPath, value: "done" },
+    { path: shellPath, value: { exitCode: 0, stdout: "ok", stderr: "" } },
+    { path: checkpoint.path, value: true, checkpoint: { name: "ship", prompt: "Ship?", context: null } },
   ] as const;
-  for (const [path, value] of inherited) assert.deepEqual(await reloadedChild.replay(path), { path, value });
+  for (const expected of inherited) assert.deepEqual(await reloadedChild.replay(expected.path), expected);
   assert.equal(await reloadedChild.replay(pending.path), undefined);
   assert.equal((await reloadedChild.awaitingCheckpoints()).length, 0);
   assert.equal(await reloadedChild.awaitCheckpoint(checkpoint), true);
@@ -422,7 +422,7 @@ void test("replays completed agent, shell, and checkpoint operations across rest
   await grandchild.create({ id: "run-c", workflowName: "x", cwd, sessionId: "session-a", state: "interrupted", parentRunId: "run-b", retry: { sourceRunId: "run-b", lineageRootRunId: "run-a", completedPaths: [agentPath, shellPath, checkpoint.path], incompletePaths: ["agent/parallel/bad"], namedWorktrees: [] }, agents: [], agentSessions: [] }, snapshot);
   await grandchild.complete(newPath, "new");
   const restartedGrandchild = new RunStore(cwd, "session-a", "run-c", home);
-  for (const [path, value] of inherited) assert.deepEqual(await restartedGrandchild.replay(path), { path, value });
+  for (const expected of inherited) assert.deepEqual(await restartedGrandchild.replay(expected.path), expected);
   assert.deepEqual(await restartedGrandchild.replay(newPath), { path: newPath, value: "new" });
   for (const replayStore of [reloadedChild, restartedGrandchild]) assert.equal(await replayStore.replay(structuralPath("agent", "parallel", "bad")), undefined);
   assert.equal((await source.load()).run.state, "failed");
@@ -468,9 +468,47 @@ void test("persists awaiting checkpoints and atomically accepts only the first a
   assert.deepEqual(await new RunStore(cwd, "session-a", "run-a", home).awaitingCheckpoints(), [checkpoint]);
   const answers = await Promise.all([store.answerCheckpoint("ship", true), store.answerCheckpoint("ship", false)]);
   assert.equal(answers.filter(Boolean).length, 1);
-  assert.deepEqual(await store.replay(checkpoint.path), { path: checkpoint.path, value: true });
+  assert.deepEqual(await store.replay(checkpoint.path), {
+    path: checkpoint.path,
+    value: true,
+    checkpoint: {
+      name: "ship",
+      prompt: "Ship?",
+      context: { sha: "abc" },
+    },
+  });
   assert.equal(await store.awaitCheckpoint(checkpoint), true);
   assert.deepEqual(await store.awaitingCheckpoints(), []);
+});
+
+void test("loads legacy journals without checkpoint metadata and continues replaying boolean decisions", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-legacy-checkpoint-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const legacyJournal = {
+    version: 1,
+    completed: {
+      "checkpoint/legacy": { path: "checkpoint/legacy", value: true },
+      "checkpoint/rejected": { path: "checkpoint/rejected", value: false },
+    },
+    awaiting: {},
+  };
+  writeFileSync(join(store.directory, "journal.json"), `${JSON.stringify(legacyJournal)}\n`);
+
+  const reloaded = new RunStore(cwd, "session-a", "run-a", home);
+  const replayed = await reloaded.replay("checkpoint/legacy");
+  assert.deepEqual(replayed, { path: "checkpoint/legacy", value: true });
+
+  // Workflow checkpoint resolution via awaitCheckpoint replays without awaiting
+  const approved = await reloaded.awaitCheckpoint({ path: "checkpoint/legacy", name: "legacy", prompt: "Legacy prompt?", context: { detail: 1 } });
+  assert.equal(approved, true);
+
+  const rejected = await reloaded.awaitCheckpoint({ path: "checkpoint/rejected", name: "rejected", prompt: "Rejected prompt?", context: null });
+  assert.equal(rejected, false);
+
+  // Verify awaiting is not populated for already replayed legacy checkpoints
+  assert.deepEqual(await reloaded.awaitingCheckpoints(), []);
 });
 
 void test("creates worktrees from clean HEAD, preserves launch subdirectories, and cleans up only on confirmed deletion", async () => {

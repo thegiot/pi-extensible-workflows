@@ -9,7 +9,7 @@ import {
   decodeBooleanCheckpointResult, decodeBorrowedWorktreeBindings, decodeJournal, decodeLaunchSnapshot,
   decodeOwnershipRecords, decodePersistedRun, decodeSummaryProjection, decodeSystemPromptArtifact,
   decodeWorktreeReferences,
-  type AwaitingCheckpoint, type BorrowedWorktreeBinding, type CompletedOperation, type EffectiveSystemPrompt,
+  type AwaitingCheckpoint, type BorrowedWorktreeBinding, type CheckpointDecisionProvenance, type CompletedOperation, type EffectiveSystemPrompt,
   type Journal, type PendingWorkflowDecision, type PersistedOwnershipNode,
   type PersistedRun, type RunSummary, type RunSummaryArtifacts, type WorktreeReference,
 } from "./decoders.js";
@@ -380,11 +380,20 @@ export class RunStore {
     });
   }
 
-  async answerCheckpoint(name: string, approved: boolean): Promise<AwaitingCheckpoint | undefined> {
+  async answerCheckpoint(name: string, approved: boolean, provenance?: CheckpointDecisionProvenance): Promise<AwaitingCheckpoint | undefined> {
     return this.updateJournal((journal) => {
       const checkpoint = Object.values(journal.awaiting ?? {}).find((item) => item.name === name);
       if (!checkpoint || journal.completed[checkpoint.path]) return undefined;
-      journal.completed[checkpoint.path] = { path: checkpoint.path, value: approved };
+      journal.completed[checkpoint.path] = {
+        path: checkpoint.path,
+        value: approved,
+        checkpoint: {
+          name: checkpoint.name,
+          prompt: checkpoint.prompt,
+          context: checkpoint.context,
+          ...(provenance !== undefined ? { provenance } : {}),
+        },
+      };
       journal.awaiting = Object.fromEntries(Object.entries(journal.awaiting ?? {}).filter(([path]) => path !== checkpoint.path));
       return checkpoint;
     });

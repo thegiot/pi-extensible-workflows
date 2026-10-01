@@ -784,7 +784,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   const answerCheckpoint = async (runId: string, name: string, approved: boolean, silent = false, isHeadlessPolicy = false) => {
     const run = runs.get(runId);
     if (!run) return false;
-    const checkpoint = await run.store.answerCheckpoint(name, approved);
+    const checkpoint = await run.store.answerCheckpoint(name, approved, isHeadlessPolicy ? "headless_policy" : "interactive");
     if (!checkpoint) return false;
     await eventPublisher.checkpoint(run.store, run.metadata, checkpoint.name, approved ? "approved" : "rejected");
     await run.store.appendEvent({

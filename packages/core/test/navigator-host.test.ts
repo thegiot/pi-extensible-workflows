@@ -684,8 +684,26 @@ void test("navigator keeps consecutive checkpoint decisions in the same dashboar
   } };
   await executeCommand(commands[0]?.handler, "", ctx);
   assert.equal(customCalls, 5);
-  assert.deepEqual(await store.replay("checkpoint/ship"), { path: "checkpoint/ship", value: true });
-  assert.deepEqual(await store.replay("checkpoint/deploy"), { path: "checkpoint/deploy", value: false });
+  assert.deepEqual(await store.replay("checkpoint/ship"), {
+    path: "checkpoint/ship",
+    value: true,
+    checkpoint: {
+      name: "ship",
+      prompt: "Ship?",
+      context: null,
+      provenance: "interactive",
+    },
+  });
+  assert.deepEqual(await store.replay("checkpoint/deploy"), {
+    path: "checkpoint/deploy",
+    value: false,
+    checkpoint: {
+      name: "deploy",
+      prompt: "Deploy?",
+      context: null,
+      provenance: "interactive",
+    },
+  });
 });
 void test("navigator returns to the picker after deleting a run", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-delete-actions-"));

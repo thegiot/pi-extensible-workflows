@@ -875,6 +875,20 @@ void test("headless CLI resolves checkpoints with explicit --checkpoint-policy",
   const approveCheckpointEvent = approveEvents.find((e) => e.type === "checkpoint");
   assert.ok(approveCheckpointEvent, "Checkpoint event should be recorded");
   assert.equal(approveCheckpointEvent.message, "decision: approved (headless policy)");
+  const approveJournalFile = readdirSync(paths.root, { recursive: true }).map(String).find((path) => path.endsWith("/journal.json") && path.includes(approveRunId));
+  assert.ok(approveJournalFile, "approve journal file should exist");
+  const approveJournal = JSON.parse(readFileSync(join(paths.root, approveJournalFile), "utf8")) as { completed?: Record<string, unknown>; awaiting?: Record<string, unknown> };
+  assert.deepEqual(approveJournal.completed?.["checkpoint/decision"], {
+    path: "checkpoint/decision",
+    value: true,
+    checkpoint: {
+      name: "decision",
+      prompt: "Proceed?",
+      context: { detail: "alpha" },
+      provenance: "headless_policy",
+    },
+  });
+  assert.deepEqual(approveJournal.awaiting, {});
 
   const rejectRun = runIsolatedCli(paths, definition, ["run", "cliCheckpoint", "--checkpoint-policy=reject"]);
   assert.equal(rejectRun.status, 0, rejectRun.stderr);
@@ -889,6 +903,20 @@ void test("headless CLI resolves checkpoints with explicit --checkpoint-policy",
   const rejectCheckpointEvent = rejectEvents.find((e) => e.type === "checkpoint" && e.message.includes("rejected"));
   assert.ok(rejectCheckpointEvent, "Checkpoint event should be recorded");
   assert.equal(rejectCheckpointEvent.message, "decision: rejected (headless policy)");
+  const rejectJournalFile = readdirSync(paths.root, { recursive: true }).map(String).find((path) => path.endsWith("/journal.json") && path.includes(rejectRunId));
+  assert.ok(rejectJournalFile, "reject journal file should exist");
+  const rejectJournal = JSON.parse(readFileSync(join(paths.root, rejectJournalFile), "utf8")) as { completed?: Record<string, unknown>; awaiting?: Record<string, unknown> };
+  assert.deepEqual(rejectJournal.completed?.["checkpoint/decision"], {
+    path: "checkpoint/decision",
+    value: false,
+    checkpoint: {
+      name: "decision",
+      prompt: "Proceed?",
+      context: { detail: "alpha" },
+      provenance: "headless_policy",
+    },
+  });
+  assert.deepEqual(rejectJournal.awaiting, {});
 });
 
 void test("headless CLI checkpoint policy validates invalid values and missing values", () => {
@@ -958,7 +986,16 @@ void test("checkpoint journal records completed operation and clears awaiting", 
   assert.equal(journals.length, 1);
   const journalContent = JSON.parse(readFileSync(join(paths.root, journals[0] ?? ""), "utf8")) as { completed?: Record<string, { value: unknown; path: string }>; awaiting?: Record<string, unknown> };
   const completed = journalContent.completed ?? {};
-  assert.deepEqual(completed["checkpoint/audit"], { path: "checkpoint/audit", value: true });
+  assert.deepEqual(completed["checkpoint/audit"], {
+    path: "checkpoint/audit",
+    value: true,
+    checkpoint: {
+      name: "audit",
+      prompt: "Audit prompt text",
+      context: { meta: "valuable", num: 42 },
+      provenance: "headless_policy",
+    },
+  });
   assert.deepEqual(journalContent.awaiting, {});
 });
 void test("headless runtime cleanup runs for non-execution CLI paths", async () => {
