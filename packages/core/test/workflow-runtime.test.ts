@@ -153,6 +153,22 @@ void test("worker exposes deterministic core globals and JSON RPC only", async (
   assert.deepEqual(phases, ["build"]);
 });
 
+void test("sandbox checkpoint resolves the documented truthy strings (rejection hazard characterization)", async () => {
+  // Contract (docs/developers.html): sandbox checkpoint() resolves "approved" | "rejected",
+  // mapped from the boolean bridge decision at src/execution.ts (branded value envelope).
+  // BOTH strings are truthy: the `if (!decision)` idiom used by giot-workflows#24's first
+  // de-bypassed recipe silently treated a rejection as an approval. This test pins the
+  // adapter contract end to end (bridge boolean -> branded value -> unwrap) so any future
+  // return-type unification must consciously update this test and the documented contract.
+  const run = runWorkflow(`export const meta={name:'gate',description:'gate'};
+    const decision = await checkpoint({ name: 'gate' });
+    if (!decision) throw new Error('truthiness check flagged the rejection');
+    return { decision, truthy: !!decision };`, null, { checkpoint: async () => false });
+  const result = await run.result as { decision: string; truthy: boolean };
+  assert.equal(result.decision, "rejected"); // rejection is delivered as a truthy string
+  assert.equal(result.truthy, true); // `!decision` did not catch it — the documented hazard
+});
+
 void test("prompt interpolates exact values with JSON formatting and escaped braces", async () => {
   const run = runWorkflow(`export const meta={name:'prompt',description:'prompt'};
     return prompt('raw={raw}; again={raw}; number={number}; bool={bool}; nil={nil}; array={array}; object={object}; escaped={{raw}} }}', {
