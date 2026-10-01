@@ -23,7 +23,7 @@ import { showChangelogNotice } from "./changelog.js";
 import { createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectorySubagentMetadataLoader, createTrajectoryTranscriptLoader, type TrajectoryActionRequest, type TrajectoryActionResult, type TrajectorySubagent } from "./trajectory.js";
 import { getTrajectoryHost, type TrajectoryPublisherProvider } from "./trajectory-host-handle.js";
 import { getSubagentManager } from "./subagent-manager-handle.js";
-import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_BLOCKED_EVENT, WorkflowError, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, roleNameOf, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_BLOCKED_EVENT, WorkflowError, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, roleNameOf, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type CheckpointPolicy, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
 import type { SubagentManagerContext, SubagentRunRequest, SubagentStatus } from "../subagents/src/contracts.js";
 import {
   SETTLED_AGENT_STATES,
@@ -781,12 +781,17 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     }
     throw new WorkflowError("RUN_NOT_FOUND", `Unknown workflow run ${runId} in the current project`);
   };
-  const answerCheckpoint = async (runId: string, name: string, approved: boolean, silent = false) => {
+  const answerCheckpoint = async (runId: string, name: string, approved: boolean, silent = false, isHeadlessPolicy = false) => {
     const run = runs.get(runId);
     if (!run) return false;
     const checkpoint = await run.store.answerCheckpoint(name, approved);
     if (!checkpoint) return false;
     await eventPublisher.checkpoint(run.store, run.metadata, checkpoint.name, approved ? "approved" : "rejected");
+    await run.store.appendEvent({
+      type: "checkpoint",
+      message: `${checkpoint.name}: ${approved ? "approved" : "rejected"}${isHeadlessPolicy ? " (headless policy)" : ""}`,
+      timestamp: Date.now(),
+    });
     if ((await run.store.awaitingCheckpoints()).length === 0) await run.lifecycle.resolveAwaitingInput();
     run.checkpointResolvers.get(checkpoint.path)?.(approved);
     run.checkpointResolvers.delete(checkpoint.path);
@@ -800,21 +805,36 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     backgroundCheckpointDeliveries.add(key);
     deliver(pi, `Workflow ${workflowName} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
   };
-  const checkpointBridge = (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean | (() => boolean), ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, headless = false) => {
+  const checkpointBridge = (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean | (() => boolean), ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, headless = false, checkpointPolicy?: CheckpointPolicy) => {
     const checkpointCounters = new Map<string, number>();
     const isForeground = () => typeof foreground === "function" ? foreground() : foreground;
     return async (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<boolean> => {
       const input = validateCheckpoint(raw);
       const label = nextNamedOccurrence(checkpointCounters, input.name);
       const path = operationPath("checkpoint", label);
-      if (headless) fail("RESUME_INCOMPATIBLE", "Headless CLI checkpoints are unsupported");
-      if (isForeground() && !ui?.select) fail("RESUME_INCOMPATIBLE", "Foreground checkpoints require UI");
+      if (headless && !checkpointPolicy) fail("RESUME_INCOMPATIBLE", "Headless CLI checkpoints are unsupported");
+      if (isForeground() && !ui?.select && !headless) fail("RESUME_INCOMPATIBLE", "Foreground checkpoints require UI");
       const alreadyAwaiting = (await store.awaitingCheckpoints()).some((checkpoint) => checkpoint.path === path);
       const replayed = await store.awaitCheckpoint({ ...input, name: label, path });
       if (replayed !== undefined) return replayed;
       if (!alreadyAwaiting) await eventPublisher.checkpoint(store, metadata, label, "awaiting");
       const run = runs.get(runId);
       await run?.lifecycle.enterAwaitingInput();
+      if (headless && checkpointPolicy) {
+        let approved: boolean;
+        if (typeof checkpointPolicy === "function") {
+          const decision: unknown = await checkpointPolicy({ ...input, name: label, path });
+          if (decision === "approve" || decision === true) approved = true;
+          else if (decision === "reject" || decision === false) approved = false;
+          else fail("CONFIG_ERROR", `Invalid headless checkpoint decision: ${typeof decision === "string" ? decision : JSON.stringify(decision)}`);
+        } else if (checkpointPolicy === "approve") {
+          approved = true;
+        } else {
+          approved = false;
+        }
+        await answerCheckpoint(runId, label, approved, true, true);
+        return approved;
+      }
       if (!alreadyAwaiting && (!isForeground() || !ui?.select)) deliverBackgroundCheckpoint(metadata.name, runId, { ...input, name: label, path });
       const decision = new Promise<boolean>((resolve, reject) => {
         run?.checkpointResolvers.set(path, resolve);
@@ -1211,6 +1231,15 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       };
       try {
       const headless = object(ctx) && ctx.headless === true;
+      const rawCheckpointPolicy = object(ctx) ? ctx.checkpointPolicy : undefined;
+      let checkpointPolicy: CheckpointPolicy | undefined;
+      if (rawCheckpointPolicy !== undefined) {
+        if (rawCheckpointPolicy === "approve" || rawCheckpointPolicy === "reject" || typeof rawCheckpointPolicy === "function") {
+          checkpointPolicy = rawCheckpointPolicy as CheckpointPolicy;
+        } else {
+          throw new WorkflowError("CONFIG_ERROR", `Invalid checkpoint policy: ${typeof rawCheckpointPolicy === "string" ? rawCheckpointPolicy : JSON.stringify(rawCheckpointPolicy)}`);
+        }
+      }
       const settingsPath = workflowSettingsPath(extensionAgentDir);
       if (!ctx.model) throw new WorkflowError("UNKNOWN_MODEL", "A launching model is required");
       const budget = validateBudget(params.budget);
@@ -1291,7 +1320,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       runs.set(runId, runRecord);
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, () => runs.get(runId)?.budget.checkAgentLaunch(), settings.extensionSettings);
-      const execution = runWorkflow(script, args, withWorkflowFunctions({ shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId, (role, model) => capturedRoles.capture(role, model)), worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name) }, store, runContext, registry, settings.extensionSettings), runController.signal);
+      const execution = runWorkflow(script, args, withWorkflowFunctions({ shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId, (role, model) => capturedRoles.capture(role, model)), worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless, checkpointPolicy), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name) }, store, runContext, registry, settings.extensionSettings), runController.signal);
       runRecord.execution = execution;
       await eventPublisher.runStarted(store, checked.metadata);
       const finish = execution.result.then(async (value) => {

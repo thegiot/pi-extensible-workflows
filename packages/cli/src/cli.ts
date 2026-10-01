@@ -14,9 +14,11 @@ import { portableEngineVersion, portablePiVersion, writePortableWorkflowBundle }
 import { runSessionInspector, transcriptFileLines, type InspectMode } from "./session-inspector.js";
 import { isPersistedRun, listPersistedSessionIds, listRunIds, type PersistedRun } from "pi-extensible-workflows/persistence";
 import { shareTrajectoryRun } from "pi-extensible-workflows/trajectory";
-import type { WorkflowCatalogFunction } from "pi-extensible-workflows";
+import type { CheckpointPolicy, WorkflowCatalogFunction } from "pi-extensible-workflows";
 
-export interface CliOptions extends DoctorOptions { inspect?: (sessionId?: string, mode?: InspectMode, failedOnly?: boolean) => Promise<void>; transcript?: (sessionFile: string) => Promise<void>; stderr?: (text: string) => void; signal?: AbortSignal; trustOverride?: boolean; isTTY?: boolean; skillPaths?: readonly string[] }
+export type { CheckpointPolicy } from "pi-extensible-workflows";
+
+export interface CliOptions extends DoctorOptions { inspect?: (sessionId?: string, mode?: InspectMode, failedOnly?: boolean) => Promise<void>; transcript?: (sessionFile: string) => Promise<void>; stderr?: (text: string) => void; signal?: AbortSignal; trustOverride?: boolean; checkpointPolicy?: CheckpointPolicy; isTTY?: boolean; skillPaths?: readonly string[] }
 
 type CliScalar = "string" | "integer" | "number" | "boolean";
 type CliField = { name: string; option: string; schema: Record<string, unknown>; type: CliScalar | "array"; itemType?: CliScalar; required: boolean };
@@ -174,11 +176,12 @@ function launcherHelpLines(): string[] {
   return [
     "  --approve".padEnd(28) + "Trust project resources for this launch",
     "  --no-approve".padEnd(28) + "Do not trust project resources for this launch",
+    "  --checkpoint-policy <policy>  " + "Headless checkpoint policy: approve or reject",
     "  --".padEnd(28) + "End launcher option parsing; pass later tokens to workflow input",
   ];
 }
 function workflowUsage(): string { return [`Usage: piewf run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force]`, "", "Launcher options:", ...launcherHelpLines()].join("\n") + "\n"; }
-function scriptWorkflowUsage(): string { return [`Usage: piewf run --script <path> [--name <workflow-name>] [--input <json>]`, "", "Options:", ...launcherHelpLines().slice(0, 2), "  -h, --help".padEnd(28) + "Show this help"].join("\n") + "\n"; }
+function scriptWorkflowUsage(): string { return [`Usage: piewf run --script <path> [--name <workflow-name>] [--input <json>]`, "", "Options:", ...launcherHelpLines().slice(0, 3), "  -h, --help".padEnd(28) + "Show this help"].join("\n") + "\n"; }
 type ScriptWorkflowCliArgs = { help: true } | { help: false; scriptPath: string; name: string; args: JsonValue };
 function scriptWorkflowName(scriptPath: string): string {
   const filename = basename(scriptPath);
@@ -280,21 +283,39 @@ export function parseDoctorCleanupArgs(rawArgs: readonly string[]): Required<Pic
   }
   return { olderThanDays, yes };
 }
-function stripTrustOptions(rawArgs: readonly string[]): { args: string[]; trustOverride?: boolean } {
+function stripLauncherOptions(rawArgs: readonly string[]): { args: string[]; trustOverride?: boolean; checkpointPolicy?: CheckpointPolicy } {
   const args: string[] = [];
   let trustOverride: boolean | undefined;
+  let checkpointPolicy: CheckpointPolicy | undefined;
   let endOptions = false;
-  for (const arg of rawArgs) {
+  for (let index = 0; index < rawArgs.length; index += 1) {
+    const arg = requiredArg(rawArgs, index);
     if (arg === "--") { endOptions = true; args.push(arg); continue; }
     if (!endOptions && (arg === "--approve" || arg === "--no-approve")) {
       const next = arg === "--approve";
       if (trustOverride !== undefined && trustOverride !== next) throw new Error("--approve and --no-approve cannot be combined");
       trustOverride = next;
-    } else args.push(arg);
+      continue;
+    }
+    if (!endOptions && (arg === "--checkpoint-policy" || arg.startsWith("--checkpoint-policy="))) {
+      if (checkpointPolicy !== undefined) throw new Error("--checkpoint-policy may only be provided once");
+      const value = arg.startsWith("--checkpoint-policy=") ? arg.slice("--checkpoint-policy=".length) : rawArgs[++index];
+      if (!value) throw new Error("Missing value for --checkpoint-policy");
+      if (value !== "approve" && value !== "reject") {
+        throw new Error(`Invalid checkpoint policy: ${value}. Expected "approve" or "reject"`);
+      }
+      checkpointPolicy = value;
+      continue;
+    }
+    args.push(arg);
   }
-  return { args, ...(trustOverride !== undefined ? { trustOverride } : {}) };
+  return {
+    args,
+    ...(trustOverride !== undefined ? { trustOverride } : {}),
+    ...(checkpointPolicy !== undefined ? { checkpointPolicy } : {}),
+  };
 }
-type WorkflowIo = { write: (text: string) => void; stderr: (text: string) => void; cwd?: string; agentDir?: string; trustOverride?: boolean; isTTY?: boolean; signal?: AbortSignal; skillPaths?: readonly string[] };
+type WorkflowIo = { write: (text: string) => void; stderr: (text: string) => void; cwd?: string; agentDir?: string; trustOverride?: boolean; checkpointPolicy?: CheckpointPolicy; isTTY?: boolean; signal?: AbortSignal; skillPaths?: readonly string[] };
 
 type HeadlessExtensionAPI = WorkflowExtensionAPI & { events: Pick<ExtensionAPI["events"], "emit"> };
 type HeadlessWorkflowResult = { content: Array<{ type: string; text: string }>; details?: unknown };
@@ -501,7 +522,7 @@ async function createWorkflowContext(runtime: WorkflowRuntime, options: Workflow
   const model = await selectedModel(runtime.services);
   const sessionManager = SessionManager.inMemory();
   const modelRegistry = { getAll: () => availableModelInfo(runtime.services), getAvailable: () => availableModelInfo(runtime.services, true) };
-  return { cwd: options.cwd ?? process.cwd(), mode: "print" as const, hasUI: false, ...(model ? { model } : {}), modelRegistry, sessionManager, isProjectTrusted: () => runtime.services.settingsManager.isProjectTrusted(), ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {}, onTerminalInput: () => () => {}, setStatus: () => {}, setWorkingMessage: () => {}, setWorkingVisible: () => {}, setWorkingIndicator: () => {}, setHiddenThinkingLabel: () => {}, setWidget: () => {}, setFooter: () => {}, setHeader: () => {}, setTitle: () => {}, custom: async () => undefined, pasteToEditor: () => {}, setEditorText: () => {}, getEditorText: () => "", editor: async () => undefined, addAutocompleteProvider: () => {} }, headless: true };
+  return { cwd: options.cwd ?? process.cwd(), mode: "print" as const, hasUI: false, ...(model ? { model } : {}), modelRegistry, sessionManager, isProjectTrusted: () => runtime.services.settingsManager.isProjectTrusted(), ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {}, onTerminalInput: () => () => {}, setStatus: () => {}, setWorkingMessage: () => {}, setWorkingVisible: () => {}, setWorkingIndicator: () => {}, setHiddenThinkingLabel: () => {}, setWidget: () => {}, setFooter: () => {}, setHeader: () => {}, setTitle: () => {}, custom: async () => undefined, pasteToEditor: () => {}, setEditorText: () => {}, getEditorText: () => "", editor: async () => undefined, addAutocompleteProvider: () => {} }, headless: true, ...(options.checkpointPolicy !== undefined ? { checkpointPolicy: options.checkpointPolicy } : {}) };
 }
 
 async function shutdownWorkflowRuntime(handlers: readonly ShutdownHandler[], context: unknown): Promise<void> {
@@ -512,7 +533,7 @@ async function shutdownWorkflowRuntime(handlers: readonly ShutdownHandler[], con
 
 async function withWorkflowRuntime<T>(options: WorkflowIo, action: (runtime: WorkflowRuntime, context: unknown) => Promise<T>): Promise<T> {
   const shutdownHandlers: ShutdownHandler[] = [];
-  let context: unknown = { cwd: options.cwd ?? process.cwd(), mode: "print", hasUI: false, headless: true };
+  let context: unknown = { cwd: options.cwd ?? process.cwd(), mode: "print", hasUI: false, headless: true, ...(options.checkpointPolicy !== undefined ? { checkpointPolicy: options.checkpointPolicy } : {}) };
   try {
     const runtime = await createWorkflowRuntime(options, shutdownHandlers);
     context = await createWorkflowContext(runtime, options);
@@ -523,10 +544,10 @@ async function withWorkflowRuntime<T>(options: WorkflowIo, action: (runtime: Wor
 }
 
 async function runWorkflowCli(rawArgs: readonly string[], options: WorkflowIo): Promise<number> {
-  const parsed = stripTrustOptions(rawArgs);
+  const parsed = stripLauncherOptions(rawArgs);
   const args = parsed.args;
   if (!args.length || args[0] === "--help" || args[0] === "-h") { options.write(workflowUsage()); return args.length ? 0 : 1; }
-  const runtimeOptions = { ...options, ...(parsed.trustOverride !== undefined ? { trustOverride: parsed.trustOverride } : {}) };
+  const runtimeOptions = { ...options, ...(parsed.trustOverride !== undefined ? { trustOverride: parsed.trustOverride } : {}), ...(parsed.checkpointPolicy !== undefined ? { checkpointPolicy: parsed.checkpointPolicy } : {}) };
   const scriptMode = args[0] === "--script" || args[0]?.startsWith("--script=") || args[0]?.startsWith("--") && args.some((arg) => arg === "--script" || arg.startsWith("--script="));
   if (scriptMode) {
     const script = parseScriptWorkflowCliArgs(args);
@@ -551,7 +572,7 @@ async function runWorkflowCli(rawArgs: readonly string[], options: WorkflowIo): 
 }
 
 async function exportWorkflowCli(rawArgs: readonly string[], options: WorkflowIo): Promise<number> {
-  const parsed = stripTrustOptions(rawArgs);
+  const parsed = stripLauncherOptions(rawArgs);
   const args = parsed.args;
   if (args.includes("--bundle")) return bundleWorkflowCli(args.filter((arg) => arg !== "--bundle"), { ...options, ...(parsed.trustOverride !== undefined ? { trustOverride: parsed.trustOverride } : {}) });
   if (!args.length || args[0] === "--help" || args[0] === "-h") { options.write(exportUsage()); return args.length ? 0 : 1; }
@@ -590,7 +611,7 @@ async function exportWorkflowCli(rawArgs: readonly string[], options: WorkflowIo
 }
 
 async function bundleWorkflowCli(rawArgs: readonly string[], options: WorkflowIo): Promise<number> {
-  const parsed = stripTrustOptions(rawArgs);
+  const parsed = stripLauncherOptions(rawArgs);
   const args = parsed.args;
   if (!args.length || args[0] === "--help" || args[0] === "-h") { options.write(bundleUsage()); return args.length ? 0 : 1; }
   const workflowName = requiredArg(args, 0);
@@ -703,7 +724,7 @@ export async function runCli(args: readonly string[], options: CliOptions = {}, 
   }
   if (args[0] === "bundle" || args[0] === "run" || args[0] === "export") {
     try {
-      const workflowOptions: WorkflowIo = { write, stderr, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}), ...(options.agentDir !== undefined ? { agentDir: options.agentDir } : {}), ...(options.signal ? { signal: options.signal } : {}), ...(options.trustOverride !== undefined ? { trustOverride: options.trustOverride } : {}), ...(options.isTTY !== undefined ? { isTTY: options.isTTY } : {}), ...(options.skillPaths?.length ? { skillPaths: [...options.skillPaths] } : {}) };
+      const workflowOptions: WorkflowIo = { write, stderr, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}), ...(options.agentDir !== undefined ? { agentDir: options.agentDir } : {}), ...(options.signal ? { signal: options.signal } : {}), ...(options.trustOverride !== undefined ? { trustOverride: options.trustOverride } : {}), ...(options.checkpointPolicy !== undefined ? { checkpointPolicy: options.checkpointPolicy } : {}), ...(options.isTTY !== undefined ? { isTTY: options.isTTY } : {}), ...(options.skillPaths?.length ? { skillPaths: [...options.skillPaths] } : {}) };
       if (args[0] === "bundle") return await bundleWorkflowCli(args.slice(1), workflowOptions);
       return args[0] === "run" ? await runWorkflowCli(args.slice(1), workflowOptions) : await exportWorkflowCli(args.slice(1), workflowOptions);
     } catch (error) { stderr(`Error: ${errorText(error)}\n`); return 1; }

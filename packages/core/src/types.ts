@@ -353,6 +353,9 @@ export interface WorkflowFailureAgent { id: string; label?: string; role?: strin
 export interface WorkflowSiblingAgent { id: string; label?: string; role?: string; structuralPath: readonly string[] }
 export interface WorkflowFailureDiagnostics { runId: string; workflowName: string; state: RunState; failedAt: string | null; error: WorkflowErrorShape; failedAgent?: WorkflowFailureAgent; completedSiblingAgents?: readonly WorkflowSiblingAgent[]; completedSiblingPaths: readonly (readonly string[])[]; retry?: { sourceRunId: string; action: string; completedPaths: readonly string[]; incompletePaths: readonly string[]; namedWorktrees: readonly string[]; warning: string }; artifacts: { runDirectory: string; statePath: string; journalPath: string } }
 export interface CheckpointInput { name: string; prompt: string; context: JsonValue }
+export type CheckpointPolicyDecision = "approve" | "reject";
+export type CheckpointPolicyHandler = (checkpoint: Readonly<CheckpointInput & { path: string }>) => CheckpointPolicyDecision | boolean | Promise<CheckpointPolicyDecision | boolean>;
+export type CheckpointPolicy = CheckpointPolicyDecision | CheckpointPolicyHandler;
 export interface FunctionIdentity { path: string; structuralPath: readonly string[]; occurrence: number; worktreeOwner?: string }
 export type AgentContinuity = "fresh" | "continued";
 export interface AgentIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; parentBreadcrumb?: string; worktreeOwner?: string; handle?: string; turn?: number }

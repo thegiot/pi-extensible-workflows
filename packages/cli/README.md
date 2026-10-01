@@ -30,8 +30,8 @@ piewf doctor [role|role-file] [--role <role>] [--prompt <text>] [--json]
 piewf doctor cleanup [--older-than-days <days>] [--yes]
 piewf inspect [session-id] [--json|--summary] [--failed]
 piewf transcript <session-file>
-piewf run <workflow-name> [workflow arguments]
-piewf run --script <workflow.js> [--name <workflow-name>] [--input <json>]
+piewf run <workflow-name> [workflow arguments] [--checkpoint-policy <approve|reject>]
+piewf run --script <workflow.js> [--name <workflow-name>] [--input <json>] [--checkpoint-policy <approve|reject>]
 piewf export <workflow-name> [--name <command>] [--output <path>] [--force]
 piewf bundle <workflow-name> [--name <command>] [--output <directory>] [--force]
 ```
