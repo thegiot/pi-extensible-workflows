@@ -5,7 +5,7 @@ import { FairAgentScheduler, WorkflowAgentExecutor, type AgentDefinition, type A
 import { listRunIds, RunStore, structuralPath as operationPath, type PersistedRun } from "./persistence.js";
 import { budgetUsage, budgetRelaxed, mergeBudget, resumeBudgetAllowed, validateBudget, validateBudgetPatch, WorkflowBudgetRuntime } from "./budget.js";
 import { aliasDrift, createLaunchSnapshot, errorCode, errorText, jsonValue, object } from "./utils.js";
-import { LAUNCH_SNAPSHOT_IDENTITY_VERSION, WorkflowError, isExternallyEndedRunState, type AgentIdentity, type AgentResourcePolicy, type BudgetApprovalRequest, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type WorkflowExtensionSettings, type WorkflowMetadata, type WorkflowRetryProvenance, type WorkflowWorktreeReference } from "./types.js";
+import { LAUNCH_SNAPSHOT_IDENTITY_VERSION, WorkflowError, isExternallyEndedRunState, type AgentIdentity, type AgentResourcePolicy, type BudgetApprovalRequest, type CheckpointPolicy, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type WorkflowExtensionSettings, type WorkflowMetadata, type WorkflowRetryProvenance, type WorkflowWorktreeReference } from "./types.js";
 import { type WorkflowRegistryApi } from "./registry.js";
 import { RunLifecycle, WorkflowEventPublisher, hostSessionContext, withWorkflowFunctions, withoutActiveShells, workflowRunContext, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
 import { runWorkflow } from "./execution.js";
@@ -33,7 +33,7 @@ export type WorkflowRecoveryDependencies = {
   workflowAgentHandler: (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle, executor: WorkflowAgentExecutor, cwd: string, runId: string, captureRole?: (role: string, model: ModelSpec) => Promise<void>) => (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>;
   shellForRun: (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle, command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>;
   resolveWorktree: (store: RunStore, metadata: WorkflowMetadata, owner: string) => Promise<Readonly<WorkflowWorktreeReference>>;
-  checkpointBridge: (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean, ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, headless?: boolean) => (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => Promise<boolean>;
+  checkpointBridge: (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean, ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, headless?: boolean, checkpointPolicy?: CheckpointPolicy) => (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => Promise<boolean>;
   phaseBridge: (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle) => (phase: string) => Promise<void>;
   logBridge: (store: RunStore, lifecycle: RunLifecycle, workflowName: string) => (message: string) => Promise<void>;
   lifecycleFor: (store: RunStore, state: RunState, metadata: WorkflowMetadata) => RunLifecycle;

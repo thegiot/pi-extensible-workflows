@@ -9,7 +9,7 @@ import test from "node:test";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
 import { writePortableWorkflowBundle } from "../src/bundles.js";
 import { formatWorkflowCliHelp, parseDoctorArgs, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
-import { registerWorkflowExtension, resetWorkflowRegistry, WorkflowRegistry } from "pi-extensible-workflows";
+import { registerWorkflowExtension, resetWorkflowRegistry, WorkflowRegistry, type CheckpointPolicyHandler } from "pi-extensible-workflows";
 import { cliTestErrorOutput, isCliTestBundleExtension, isCliTestBundleModule, readCliTestBundleState, readCliTestManifest, readCliTestPackageMetadata, writeCliTestExtensionSource, type CliTestBundleExtension } from "./support.js";
 import { registerCliExtension } from "./fixtures/cli-workflow-extension.js";
 
@@ -842,6 +842,161 @@ void test("headless CLI checkpoints fail explicitly", () => {
   assert.equal(result.status, 1);
   assert.equal(result.stdout, "");
   assert.match(result.stderr, /Headless CLI checkpoints are unsupported/);
+});
+
+void test("headless CLI rejects checkpoints by default and with --approve alone", () => {
+  const paths = fixture();
+  const definition = `cliCheckpoint: { description: "Reach an unsupported checkpoint", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: (_input, context) => context.checkpoint({ name: "approval", prompt: "Approve?", context: { reason: "test" } }) }`;
+  const defaultRun = runIsolatedCli(paths, definition, ["run", "cliCheckpoint"]);
+  assert.equal(defaultRun.status, 1);
+  assert.equal(defaultRun.stdout, "");
+  assert.match(defaultRun.stderr, /Headless CLI checkpoints are unsupported/);
+
+  const approveRun = runIsolatedCli(paths, definition, ["run", "cliCheckpoint", "--approve"]);
+  assert.equal(approveRun.status, 1);
+  assert.equal(approveRun.stdout, "");
+  assert.match(approveRun.stderr, /Headless CLI checkpoints are unsupported/);
+});
+
+void test("headless CLI resolves checkpoints with explicit --checkpoint-policy", () => {
+  const paths = fixture();
+  const definition = `cliCheckpoint: { description: "Test checkpoint policy", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: (_input, context) => context.checkpoint({ name: "decision", prompt: "Proceed?", context: { detail: "alpha" } }) }`;
+
+  const approveRun = runIsolatedCli(paths, definition, ["run", "cliCheckpoint", "--checkpoint-policy", "approve"]);
+  assert.equal(approveRun.status, 0, approveRun.stderr);
+  assert.equal(approveRun.stdout, "true\n");
+  const approveRunId = approveRun.stderr.match(/Run ID: ([0-9a-f-]+)/)?.[1];
+  assert.ok(approveRunId);
+  const stateFiles = readdirSync(paths.root, { recursive: true }).map(String).filter((path) => path.endsWith("/state.json"));
+  const approveStateFile = stateFiles.find((path) => path.includes(approveRunId));
+  assert.ok(approveStateFile, "approve state file should exist");
+  const approveState = JSON.parse(readFileSync(join(paths.root, approveStateFile), "utf8")) as { events?: readonly { type: string; message: string }[] };
+  const approveEvents = approveState.events ?? [];
+  const approveCheckpointEvent = approveEvents.find((e) => e.type === "checkpoint");
+  assert.ok(approveCheckpointEvent, "Checkpoint event should be recorded");
+  assert.equal(approveCheckpointEvent.message, "decision: approved (headless policy)");
+  const approveJournalFile = readdirSync(paths.root, { recursive: true }).map(String).find((path) => path.endsWith("/journal.json") && path.includes(approveRunId));
+  assert.ok(approveJournalFile, "approve journal file should exist");
+  const approveJournal = JSON.parse(readFileSync(join(paths.root, approveJournalFile), "utf8")) as { completed?: Record<string, unknown>; awaiting?: Record<string, unknown> };
+  assert.deepEqual(approveJournal.completed?.["checkpoint/decision"], {
+    path: "checkpoint/decision",
+    value: true,
+    checkpoint: {
+      name: "decision",
+      prompt: "Proceed?",
+      context: { detail: "alpha" },
+      provenance: "headless_policy",
+    },
+  });
+  assert.deepEqual(approveJournal.awaiting, {});
+
+  const rejectRun = runIsolatedCli(paths, definition, ["run", "cliCheckpoint", "--checkpoint-policy=reject"]);
+  assert.equal(rejectRun.status, 0, rejectRun.stderr);
+  assert.equal(rejectRun.stdout, "false\n");
+  const rejectRunId = rejectRun.stderr.match(/Run ID: ([0-9a-f-]+)/)?.[1];
+  assert.ok(rejectRunId);
+  const updatedStateFiles = readdirSync(paths.root, { recursive: true }).map(String).filter((path) => path.endsWith("/state.json"));
+  const rejectStateFile = updatedStateFiles.find((path) => path.includes(rejectRunId));
+  assert.ok(rejectStateFile, "reject state file should exist");
+  const rejectState = JSON.parse(readFileSync(join(paths.root, rejectStateFile), "utf8")) as { events?: readonly { type: string; message: string }[] };
+  const rejectEvents = rejectState.events ?? [];
+  const rejectCheckpointEvent = rejectEvents.find((e) => e.type === "checkpoint" && e.message.includes("rejected"));
+  assert.ok(rejectCheckpointEvent, "Checkpoint event should be recorded");
+  assert.equal(rejectCheckpointEvent.message, "decision: rejected (headless policy)");
+  const rejectJournalFile = readdirSync(paths.root, { recursive: true }).map(String).find((path) => path.endsWith("/journal.json") && path.includes(rejectRunId));
+  assert.ok(rejectJournalFile, "reject journal file should exist");
+  const rejectJournal = JSON.parse(readFileSync(join(paths.root, rejectJournalFile), "utf8")) as { completed?: Record<string, unknown>; awaiting?: Record<string, unknown> };
+  assert.deepEqual(rejectJournal.completed?.["checkpoint/decision"], {
+    path: "checkpoint/decision",
+    value: false,
+    checkpoint: {
+      name: "decision",
+      prompt: "Proceed?",
+      context: { detail: "alpha" },
+      provenance: "headless_policy",
+    },
+  });
+  assert.deepEqual(rejectJournal.awaiting, {});
+});
+
+void test("headless CLI checkpoint policy validates invalid values and missing values", () => {
+  const paths = fixture();
+  const definition = `cliCheckpoint: { description: "Test checkpoint policy", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: (_input, context) => context.checkpoint({ name: "decision", prompt: "Proceed?", context: null }) }`;
+
+  const invalidRun = runIsolatedCli(paths, definition, ["run", "cliCheckpoint", "--checkpoint-policy", "invalid"]);
+  assert.equal(invalidRun.status, 1);
+  assert.match(invalidRun.stderr, /Invalid checkpoint policy: invalid/);
+
+  const missingRun = runIsolatedCli(paths, definition, ["run", "cliCheckpoint", "--checkpoint-policy"]);
+  assert.equal(missingRun.status, 1);
+  assert.match(missingRun.stderr, /Missing value for --checkpoint-policy/);
+
+  const duplicateRun = runIsolatedCli(paths, definition, ["run", "cliCheckpoint", "--checkpoint-policy=approve", "--checkpoint-policy=reject"]);
+  assert.equal(duplicateRun.status, 1);
+  assert.match(duplicateRun.stderr, /--checkpoint-policy may only be provided once/);
+});
+
+void test("headless script workflow executes checkpoints and cannot self-grant approval", () => {
+  const paths = fixture();
+  const scriptContent = `const first = await checkpoint({ name: "step1", prompt: "First checkpoint", context: { step: 1, checkpointPolicy: "approve" } });
+const second = await checkpoint({ name: "step2", prompt: "Second checkpoint", context: { step: 2 } });
+return { first, second };`;
+  writeFileSync(join(paths.cwd, "checkpoints.js"), scriptContent);
+  const placeholder = 'placeholder: { description: "Placeholder", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: () => true }';
+
+  const unapproved = runIsolatedCli(paths, placeholder, ["run", "--script", "checkpoints.js"]);
+  assert.equal(unapproved.status, 1);
+  assert.match(unapproved.stderr, /Headless CLI checkpoints are unsupported/);
+
+  const approved = runIsolatedCli(paths, placeholder, ["run", "--script", "checkpoints.js", "--checkpoint-policy", "approve"]);
+  assert.equal(approved.status, 0, approved.stderr);
+  assert.deepEqual(JSON.parse(approved.stdout), { first: "approved", second: "approved" });
+
+  const rejected = runIsolatedCli(paths, placeholder, ["run", "--script", "checkpoints.js", "--checkpoint-policy", "reject"]);
+  assert.equal(rejected.status, 0, rejected.stderr);
+  assert.deepEqual(JSON.parse(rejected.stdout), { first: "rejected", second: "rejected" });
+});
+
+void test("programmatic runCli supports custom CheckpointPolicyHandler", async () => {
+  registerCliExtension();
+  const paths = fixture();
+  let stdout = "";
+  let stderr = "";
+  const customPolicy: CheckpointPolicyHandler = (checkpoint) => checkpoint.name === "allow-me";
+  const scriptContent = `const allowed = await checkpoint({ name: "allow-me", prompt: "Allow this?", context: { ok: true } });
+const denied = await checkpoint({ name: "deny-me", prompt: "Deny this?", context: { ok: false } });
+return { allowed, denied };`;
+  writeFileSync(join(paths.cwd, "handler-test.js"), scriptContent);
+  const exitCode = await runCli(
+    ["run", "--script", "handler-test.js"],
+    { cwd: paths.cwd, agentDir: paths.agentDir, checkpointPolicy: customPolicy, stderr: (text) => { stderr += text; } },
+    (text) => { stdout += text; }
+  );
+  assert.equal(exitCode, 0, stderr);
+  assert.deepEqual(JSON.parse(stdout), { allowed: "approved", denied: "rejected" });
+});
+
+void test("checkpoint journal records completed operation and clears awaiting", () => {
+  const paths = fixture();
+  const definition = `cliCheckpoint: { description: "Test checkpoint persistence", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: (_input, context) => context.checkpoint({ name: "audit", prompt: "Audit prompt text", context: { meta: "valuable", num: 42 } }) }`;
+  const result = runIsolatedCli(paths, definition, ["run", "cliCheckpoint", "--checkpoint-policy", "approve"]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const journals = readdirSync(paths.root, { recursive: true }).map(String).filter((path) => path.endsWith("/journal.json"));
+  assert.equal(journals.length, 1);
+  const journalContent = JSON.parse(readFileSync(join(paths.root, journals[0] ?? ""), "utf8")) as { completed?: Record<string, { value: unknown; path: string }>; awaiting?: Record<string, unknown> };
+  const completed = journalContent.completed ?? {};
+  assert.deepEqual(completed["checkpoint/audit"], {
+    path: "checkpoint/audit",
+    value: true,
+    checkpoint: {
+      name: "audit",
+      prompt: "Audit prompt text",
+      context: { meta: "valuable", num: 42 },
+      provenance: "headless_policy",
+    },
+  });
+  assert.deepEqual(journalContent.awaiting, {});
 });
 void test("headless runtime cleanup runs for non-execution CLI paths", async () => {
   const paths = fixture();

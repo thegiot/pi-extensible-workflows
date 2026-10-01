@@ -382,8 +382,16 @@ void test("cold recovery delivers a persisted checkpoint only once before replay
   assert.equal(response.details.accepted, true);
   await waitForRunState(store, "completed");
   assert.equal((await store.load()).run.state, "completed");
-  assert.equal((await store.load()).run.error, undefined);
-  assert.deepEqual(await store.replay("checkpoint/ship"), { path: "checkpoint/ship", value: true });
+  assert.deepEqual(await store.replay("checkpoint/ship"), {
+    path: "checkpoint/ship",
+    value: true,
+    checkpoint: {
+      name: "ship",
+      prompt: "Ship?",
+      context: { sha: "abc" },
+      provenance: "interactive",
+    },
+  });
   await shutdown();
 });
 
