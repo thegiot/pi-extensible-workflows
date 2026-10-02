@@ -1224,6 +1224,31 @@ void test("closes workspaces for every terminal run state and session shutdown",
   await shutdown;
   assert.deepEqual(closed, ["failed", "stopped", "interrupted", "budget_exhausted", "completed"]); assert.equal(closeAll, 1);
 });
+void test("terminal run events delivered as hooks close the workspace (issue #22 delivery half)", async () => {
+  // Headless runs cannot keep load-time event-bus subscriptions alive: every AgentSession
+  // disposal invalidates the shared extension runtime and unsubscribes the bus. The headless
+  // CLI therefore re-emits terminal run events as HOOKS to handlers registered via pi.on,
+  // and those live in the loaded extension definitions, which survive session churn. This
+  // test keeps the two channels in separate maps and invokes ONLY the hook handlers,
+  // mirroring the post-invalidation state of a headless run.
+  const busHandlers = new Map(); const hookHandlers = new Map(); const closed = [];
+  const workspaces = { open: async () => { throw new Error("workspace open is not part of the delivery contract"); }, close: async (runId) => { closed.push(runId); }, closeAll: async () => {}, flush: async () => {} };
+  const pi = { events: { on(name, handler) { busHandlers.set(name, handler); } }, on(name, handler) { hookHandlers.set(name, handler); } };
+  resetWorkflowRegistry();
+  extension(pi, { env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "pane" }, workspaces });
+  assert.ok(busHandlers.get(WORKFLOW_RUN_STATE_CHANGED_EVENT), "the bus subscription must still be registered for interactive runs");
+  assert.ok(hookHandlers.get(WORKFLOW_RUN_STATE_CHANGED_EVENT), "the hook twin must be registered for headless delivery");
+  assert.ok(hookHandlers.get(WORKFLOW_RUN_COMPLETED_EVENT), "the hook twin must be registered for headless delivery");
+  // "completed" closes through the dedicated run-completed event (same as the bus path);
+  // the other terminal states close through the state-changed event.
+  await hookHandlers.get(WORKFLOW_RUN_STATE_CHANGED_EVENT)({ runId: "run-hook", state: "completed" });
+  await hookHandlers.get(WORKFLOW_RUN_COMPLETED_EVENT)({ runId: "run-hook" });
+  await hookHandlers.get(WORKFLOW_RUN_STATE_CHANGED_EVENT)({ runId: "run-hook", state: "failed" });
+  assert.deepEqual(closed, ["run-hook", "run-hook"]);
+  // A non-terminal state change must not close anything.
+  await hookHandlers.get(WORKFLOW_RUN_STATE_CHANGED_EVENT)({ runId: "run-hook", state: "running" });
+  assert.deepEqual(closed, ["run-hook", "run-hook"]);
+});
 void test("default workspace manager reuses one workspace and closes it once on completion", async () => {
   resetWorkflowRegistry();
   const root = mkdtempSync(join(tmpdir(), "herdr-extension-workspace-lifecycle-"));

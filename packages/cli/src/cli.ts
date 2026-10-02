@@ -4,12 +4,12 @@ import { chmodSync, linkSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeF
 import { homedir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionFromServices, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type ExtensionAPI, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionFromServices, createAgentSessionServices, createEventBus, getAgentDir, hasTrustRequiringProjectResources, type ExtensionAPI, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorOptions } from "./doctor.js";
 import { doctorCleanup, doctorCleanupExitCode, formatDoctorCleanupReport, type DoctorCleanupOptions } from "./doctor-cleanup.js";
 import { loadAgentDefinitions } from "pi-extensible-workflows/roles";
-import workflowExtension, { errorText, formatWorkflowProgress, isNodeError, jsonValue, object, registeredWorkflowFunctionSources, sameFilesystemPath, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowExtensionAPI, type WorkflowProgressStyles } from "pi-extensible-workflows";
+import workflowExtension, { WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, errorText, formatWorkflowProgress, isNodeError, jsonValue, object, registeredWorkflowFunctionSources, sameFilesystemPath, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowExtensionAPI, type WorkflowProgressStyles } from "pi-extensible-workflows";
 import { portableEngineVersion, portablePiVersion, writePortableWorkflowBundle } from "./bundles.js";
 import { runSessionInspector, transcriptFileLines, type InspectMode } from "./session-inspector.js";
 import { isPersistedRun, listPersistedSessionIds, listRunIds, type PersistedRun } from "pi-extensible-workflows/persistence";
@@ -358,11 +358,19 @@ async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: Shut
     if (savedTrust !== null) return savedTrust;
     return defaultProjectTrust === "always";
   };
+  // [#22] Share ONE event bus between the workflow publisher sink and the Pi
+  // extensions loaded for this headless run. Before this bridge, the headless
+  // sink was `{ emit() {} }`, so workflow run events (including terminal
+  // states) never reached extensions: `registerWorkspaceLifecycle` in the
+  // herdr extension starved and workspace containers leaked on every
+  // terminal state. This mirrors the interactive contract, where
+  // `piHostCapabilities(pi).events` IS the same bus extensions subscribe to.
+  const workflowEventBus = createEventBus();
   const services = await createAgentSessionServices({
     cwd,
     agentDir,
     settingsManager,
-    resourceLoaderOptions: { ...(options.skillPaths?.length ? { additionalSkillPaths: [...options.skillPaths] } : {}) },
+    resourceLoaderOptions: { eventBus: workflowEventBus, ...(options.skillPaths?.length ? { additionalSkillPaths: [...options.skillPaths] } : {}) },
     resourceLoaderReloadOptions: { resolveProjectTrust },
   });
   const extensions = services.resourceLoader.getExtensions();
@@ -376,7 +384,7 @@ async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: Shut
     on(name: string, handler: unknown) { if (name === "session_shutdown" && typeof handler === "function") shutdownHandlers.push(handler as ShutdownHandler); return () => {}; },
     appendEntry() {},
     sendMessage() {},
-    events: { emit() {} },
+    events: workflowEventBus,
   } satisfies HeadlessExtensionAPI;
   workflowExtension(headlessPi, homedir(), undefined, undefined, agentDir, options.skillPaths);
   const workflowTool = tools.find(isHeadlessWorkflowTool);
@@ -494,25 +502,69 @@ class CliProgress {
 
 type CliWorkflowResult = { value: JsonValue; runId?: string };
 type CliWorkflowLaunch = { name: string; args: JsonValue; fn?: WorkflowCatalogFunction; scriptPath?: string };
+/**
+ * [#22] Deliver terminal workflow run events to extensions through the stable
+ * hook channel. Load-time `pi.events.on(...)` subscriptions cannot survive a
+ * headless run: every AgentSession disposal invalidates the shared extension
+ * runtime, which unsubscribes everything the extension attached to the event
+ * bus. Hook handlers registered via `pi.on(name, handler)` live in the loaded
+ * extension definitions and are unaffected, so the CLI re-emits the terminal
+ * run events as hooks to every extension that registered for them. Payloads
+ * mirror the core publisher's event shapes (runId/state for state changes,
+ * runId for completion).
+ */
+type TerminalRunDelivery = { runId?: string | undefined; state: string; resultPath?: string | undefined };
+function deliverTerminalRunEvents(runtime: WorkflowRuntime, delivery: TerminalRunDelivery, cwd: string): void {
+  const extensions = runtime.services.resourceLoader.getExtensions().extensions;
+  const stateChanged = { type: WORKFLOW_RUN_STATE_CHANGED_EVENT, runId: delivery.runId, state: delivery.state, timestamp: Date.now() };
+  const completed = { type: WORKFLOW_RUN_COMPLETED_EVENT, runId: delivery.runId, ...(delivery.resultPath ? { resultPath: delivery.resultPath } : {}), timestamp: Date.now() };
+  const context = { cwd, mode: "print" as const, hasUI: false, ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {} } };
+  for (const extension of extensions) {
+    const deliveries: Array<readonly [string, unknown]> = [[WORKFLOW_RUN_STATE_CHANGED_EVENT, stateChanged]];
+    if (delivery.state === "completed") deliveries.push(["workflow:run-completed", completed]);
+    for (const [name, event] of deliveries) {
+      for (const handler of extension.handlers.get(name) ?? []) {
+        try { void Promise.resolve((handler as (event: unknown, ctx: unknown) => unknown)(event, context)).catch(() => undefined); } catch { /* Terminal delivery is best effort and must not alter the CLI result. */ }
+      }
+    }
+  }
+}
 async function invokeWorkflow(launch: CliWorkflowLaunch, runtime: WorkflowRuntime, options: WorkflowIo, context: unknown): Promise<CliWorkflowResult> {
   if (launch.fn && (!object(launch.args) || !Value.Check(launch.fn.input, launch.args))) throw new Error(`Invalid input for ${launch.fn.name}`);
   if (!launch.fn && launch.scriptPath === undefined) throw new Error("Workflow launch has no source");
   let announcedRunId: string | undefined;
   const announceRunId = (runId: string) => { if (announcedRunId === runId) return; announcedRunId = runId; options.stderr(`Run ID: ${runId}\n`); };
   const progress = new CliProgress(options.stderr, options.isTTY ?? process.stderr.isTTY, announceRunId);
+  let lastPersistedRunId: string | undefined;
+  let lastPersistedTerminalState: string | undefined;
   try {
     const params = launch.scriptPath === undefined
       ? { name: launch.name, script: `return await ${launch.fn?.name ?? launch.name}(args);`, args: launch.args, foreground: true }
       : { name: launch.name, scriptPath: launch.scriptPath, args: launch.args, foreground: true };
-    const result: unknown = await runtime.workflowTool.execute(randomUUID(), params, options.signal, (update: unknown) => { if (object(update) && object(update.details) && isPersistedRun(update.details.run)) progress.update(update.details.run); }, context);
+    const result: unknown = await runtime.workflowTool.execute(randomUUID(), params, options.signal, (update: unknown) => {
+      if (object(update) && object(update.details) && isPersistedRun(update.details.run)) {
+        progress.update(update.details.run);
+        const run = update.details.run;
+        if (typeof run.id === "string" && typeof run.state === "string" && run.state !== "running" && run.state !== "pausing") {
+          lastPersistedRunId = run.id;
+          lastPersistedTerminalState = run.state;
+        }
+      }
+    }, context);
     if (!isHeadlessWorkflowResult(result)) throw new Error("Workflow returned an invalid result");
     const details = object(result.details) ? result.details : {};
     const runId = typeof details.runId === "string" ? details.runId : undefined;
     if (runId) announceRunId(runId);
+    deliverTerminalRunEvents(runtime, { runId, state: "completed" }, options.cwd ?? process.cwd());
     if (has(details, "value") && jsonValue(details.value)) return { value: details.value, ...(runId ? { runId } : {}) };
     const first = result.content[0];
     if (!first || first.type !== "text") throw new Error("Workflow returned no result");
     try { return { value: parseJsonInput(first.text), ...(runId ? { runId } : {}) }; } catch { throw new Error("Workflow returned invalid JSON"); }
+  } catch (error) {
+    if (lastPersistedTerminalState !== undefined) {
+      deliverTerminalRunEvents(runtime, { runId: lastPersistedRunId, state: lastPersistedTerminalState }, options.cwd ?? process.cwd());
+    }
+    throw error;
   } finally {
     progress.finish();
   }
