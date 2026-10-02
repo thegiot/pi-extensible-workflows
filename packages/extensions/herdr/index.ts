@@ -762,6 +762,22 @@ function registerWorkspaceLifecycle(pi: ExtensionAPI | null | undefined, workspa
   if (!hasExtensionHooks(pi)) return;
   pi.events.on(WORKFLOW_RUN_COMPLETED_EVENT, (event) => { if (isRunEvent(event)) void workspaces.close(event.runId); });
   pi.events.on(WORKFLOW_RUN_STATE_CHANGED_EVENT, (event) => { if (isRunEvent(event) && isTerminalRunState((event as { state?: unknown }).state)) void workspaces.close(event.runId); });
+  // [#22] Hook-channel twin of the bus subscriptions above. In headless runs every
+  // AgentSession disposal invalidates the shared extension runtime, which unsubscribes
+  // ALL load-time event-bus listeners, so the bus path starves there. Hook handlers live
+  // in the loaded extension definitions and survive session churn; the headless CLI
+  // re-emits terminal run events through this channel. close(runId) is idempotent, so a
+  // delivery on both channels in environments where both stay alive is harmless.
+  const closeOnRunCompleted = (event: unknown): void => { if (isRunEvent(event)) void workspaces.close(event.runId); };
+  const closeOnTerminalState = (event: unknown): void => { if (isRunEvent(event) && isTerminalRunState((event as { state?: unknown }).state)) void workspaces.close(event.runId); };
+  // `pi.on` accepts arbitrary hook names at runtime (handlers are stored per name), but the
+  // published overloads enumerate only Pi's own events, so the registration goes through a
+  // narrow local signature.
+  const registerHook = (name: string, handler: (event: unknown, ctx: unknown) => void): void => {
+    (pi.on as (event: string, handler: (event: unknown, ctx: unknown) => void) => () => void)(name, handler);
+  };
+  registerHook(WORKFLOW_RUN_COMPLETED_EVENT, closeOnRunCompleted);
+  registerHook(WORKFLOW_RUN_STATE_CHANGED_EVENT, closeOnTerminalState);
   pi.on("session_shutdown", async () => { await workspaces.closeAll(); });
 }
 
