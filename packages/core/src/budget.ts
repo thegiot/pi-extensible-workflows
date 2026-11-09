@@ -1,4 +1,4 @@
-import { BUDGET_DIMENSIONS, WorkflowError, type BudgetDimension, type BudgetEvent, type BudgetLimits, type WorkflowBudget, type WorkflowBudgetPatch, type WorkflowBudgetUsage, type AgentAccounting, type RunState } from "./types.js";
+import { BUDGET_DIMENSIONS, WorkflowError, type CostProvenance, type BudgetDimension, type BudgetEvent, type BudgetLimits, type WorkflowBudget, type WorkflowBudgetPatch, type WorkflowBudgetUsage, type AgentAccounting, type RunState } from "./types.js";
 import { fail, object } from "./utils.js";
 const BUDGET_LIMITS = ["soft", "hard"] as const;
 type BudgetLimit = (typeof BUDGET_LIMITS)[number];
@@ -48,11 +48,18 @@ export function validateBudget(value: unknown): WorkflowBudget | undefined {
   for (const [dimension, raw] of dimensionEntries(value)) {
     if (!object(raw)) fail("INVALID_METADATA", `${dimension} budget must be an object`);
     const limits: BudgetLimits = {};
-    for (const [key, rawLimit] of limitEntries(raw, `${dimension} budget has an unknown limit`)) {
+    const strict = dimension === "costUsd" && "requireProvenance" in raw;
+    if (strict && (!Object.hasOwn(raw, "requireProvenance") || raw.requireProvenance !== true || !nonNegativeFinite(raw.hard))) {
+      fail("INVALID_METADATA", "costUsd.requireProvenance must be true and requires a hard cost limit");
+    }
+    const data = strict ? Object.fromEntries(Object.entries(raw).filter(([key]) => key !== "requireProvenance")) : raw;
+    for (const [key, rawLimit] of limitEntries(data, `${dimension} budget has an unknown limit`)) {
       if (rawLimit !== undefined) limits[key] = validatedLimit(rawLimit, dimension, key);
     }
     if (limits.soft !== undefined && limits.hard !== undefined && limits.soft >= limits.hard) fail("INVALID_METADATA", `${dimension}.soft must be less than hard`);
-    if (Object.keys(limits).length) result[dimension] = limits;
+    if (strict && limits.hard !== undefined) {
+      result.costUsd = Object.freeze({ ...limits, hard: limits.hard, requireProvenance: true });
+    } else if (Object.keys(limits).length) result[dimension] = limits;
   }
   return Object.freeze(result);
 }
@@ -72,7 +79,7 @@ export function validateBudgetPatch(value: unknown): WorkflowBudgetPatch {
   }
   return result;
 }
-export function budgetUsage(value?: Partial<WorkflowBudgetUsage>): WorkflowBudgetUsage { return { tokens: value?.tokens ?? 0, costUsd: value?.costUsd ?? 0, durationMs: value?.durationMs ?? 0, agentLaunches: value?.agentLaunches ?? 0 }; }
+export function budgetUsage(value?: Partial<WorkflowBudgetUsage>): WorkflowBudgetUsage { return { tokens: value?.tokens ?? 0, costUsd: value?.costUsd ?? 0, ...(value?.costProvenance ? { costProvenance: value.costProvenance } : {}), durationMs: value?.durationMs ?? 0, agentLaunches: value?.agentLaunches ?? 0 }; }
 export class WorkflowBudgetRuntime {
   readonly #now: () => number;
   readonly #onChange: (() => void) | undefined;
@@ -83,21 +90,49 @@ export class WorkflowBudgetRuntime {
   #usage: WorkflowBudgetUsage;
   #events: BudgetEvent[];
   #turnAccounting?: { input: number; output: number; cost: number };
-  constructor(readonly budget: WorkflowBudget | undefined, readonly version = 1, usage?: Partial<WorkflowBudgetUsage>, events: readonly BudgetEvent[] = [], options: { now?: () => number; onChange?: () => void; active?: boolean } = {}) { this.#now = options.now ?? (() => Date.now()); this.#onChange = options.onChange; this.#active = options.active ?? true; this.#activeSince = this.#active ? this.#now() : undefined; this.#usage = budgetUsage(usage); this.#events = [...events]; for (const event of events) if (event.budgetVersion === version) this.#seen.add(event.type); }
+  constructor(readonly budget: WorkflowBudget | undefined, readonly version = 1, usage?: Partial<WorkflowBudgetUsage>, events: readonly BudgetEvent[] = [], options: { now?: () => number; onChange?: () => void; active?: boolean } = {}) {
+    this.#now = options.now ?? (() => Date.now());
+    this.#onChange = options.onChange;
+    this.#active = options.active ?? true;
+    this.#activeSince = this.#active ? this.#now() : undefined;
+    this.#usage = budgetUsage(usage);
+    if (budget?.costUsd?.requireProvenance) {
+      const evidence = this.#usage.costProvenance;
+      if (evidence?.status === "pending") this.#usage.costProvenance = { status: "unknown", reason: "unsettled_request" };
+      else if (!evidence) this.#usage.costProvenance = usage ? { status: "unknown", reason: "missing_provenance" } : { status: "estimated", usd: 0 };
+      if (this.#usage.costProvenance?.status === "estimated") this.#usage.costUsd = this.#usage.costProvenance.usd;
+    }
+    this.#events = [...events];
+    for (const event of events) if (event.budgetVersion === version) this.#seen.add(event.type);
+  }
   get usage(): WorkflowBudgetUsage { this.#syncDuration(); return { ...this.#usage }; }
   get events(): readonly BudgetEvent[] { return this.#events; }
   get hardExhausted(): boolean { return this.#events.some((event) => event.type === "hard_exhausted" && event.budgetVersion === this.version); }
-  checkAgentLaunch(): void { this.#checkHard(["agentLaunches"]); }
-  beforeAttempt(): void { this.#checkHard(["agentLaunches"]); this.#usage.agentLaunches += 1; this.#evaluate(); }
+  checkCost(): void { if (this.budget?.costUsd?.requireProvenance) this.#checkHard(["costUsd"]); }
+  observeCost(provenance: CostProvenance): void {
+    const limit = this.budget?.costUsd;
+    if (!limit?.requireProvenance || this.#usage.costProvenance?.status === "unknown") return;
+    this.#usage.costProvenance = provenance;
+    if (provenance.status !== "unknown") this.#usage.costUsd = provenance.usd;
+    this.#evaluate();
+    if (provenance.status === "unknown" || this.#usage.costUsd >= limit.hard) this.#record("hard_exhausted", ["costUsd"]);
+  }
+  checkAgentLaunch(): void { this.checkCost(); this.#checkHard(["agentLaunches"]); }
+  beforeAttempt(): void { this.checkAgentLaunch(); this.#usage.agentLaunches += 1; this.#evaluate(); }
   beforeTurn(): void { this.#syncDuration(); this.#evaluate(); this.#checkHard(["tokens", "costUsd", "durationMs"]); }
   afterTurn(accounting: AgentAccounting, final: boolean): void { this.#syncDuration(); this.#applyTurn(accounting, final, this.#turnAccounting); this.#turnAccounting = { input: accounting.input, output: accounting.output, cost: accounting.cost }; }
-  #applyTurn(accounting: AgentAccounting, final: boolean, previous = { input: 0, output: 0, cost: 0 }): void { this.#usage.tokens += Math.max(0, accounting.input - previous.input) + Math.max(0, accounting.output - previous.output); this.#usage.costUsd += Math.max(0, accounting.cost - previous.cost); this.#evaluate(); if (!final) this.#checkHard(["tokens", "costUsd", "durationMs"]); }
+  #applyTurn(accounting: AgentAccounting, final: boolean, previous = { input: 0, output: 0, cost: 0 }): void { this.#usage.tokens += Math.max(0, accounting.input - previous.input) + Math.max(0, accounting.output - previous.output); if (!this.budget?.costUsd?.requireProvenance) this.#usage.costUsd += Math.max(0, accounting.cost - previous.cost); this.#evaluate(); if (!final) this.#checkHard(["tokens", "costUsd", "durationMs"]); }
   instruction(agentId = "agent"): string | undefined { if (!this.#hasSoftCrossed() || this.#injected.has(agentId)) return undefined; this.#injected.add(agentId); return `The workflow budget soft limit has been reached. Finish the requested output now, preserving any required output schema. Current usage: ${JSON.stringify(this.usage)}. Do not start additional model work unless it is required to produce the final requested result.`; }
   forAgent(agentId: string) { let attempt = 0; let previous: { input: number; output: number; cost: number } | undefined; return { beforeAttempt: () => { attempt += 1; previous = undefined; this.beforeAttempt(); }, beforeTurn: () => { this.beforeTurn(); }, afterTurn: (accounting: AgentAccounting, final: boolean) => { this.#applyTurn(accounting, final, previous); previous = { input: accounting.input, output: accounting.output, cost: accounting.cost }; }, instruction: () => this.instruction(`${agentId}:${String(attempt + 1)}`) }; }
   transition(state: RunState): void { const active = state === "running"; if (active === this.#active) return; if (active) { this.#active = true; this.#activeSince = this.#now(); } else { this.#syncDuration(); this.#evaluate(); this.#active = false; this.#activeSince = undefined; } this.#onChange?.(); }
   #syncDuration(): void { if (this.#active && this.#activeSince !== undefined) { const now = this.#now(); this.#usage.durationMs += Math.max(0, now - this.#activeSince); this.#activeSince = now; } }
   #hasSoftCrossed(): boolean { return !!this.budget && budgetEntries(this.budget).some(([dimension, limits]) => limits.soft !== undefined && this.#usage[dimension] >= limits.soft); }
-  #checkHard(dimensions: readonly BudgetDimension[]): void { const exhausted = dimensions.filter((dimension) => { const hard = this.budget?.[dimension]?.hard; return hard !== undefined && this.#usage[dimension] >= hard; }); if (!exhausted.length) return; this.#record("hard_exhausted", exhausted); const detail = exhausted.map((dimension) => `${dimension} usage=${String(this.#usage[dimension])} hard=${String(this.budget?.[dimension]?.hard)}`).join(", "); throw new WorkflowError("BUDGET_EXHAUSTED", `Budget version ${String(this.version)} exhausted: ${detail}`); }
+  #checkHard(dimensions: readonly BudgetDimension[]): void {
+    if (dimensions.includes("costUsd") && this.budget?.costUsd?.requireProvenance && this.#usage.costProvenance?.status === "unknown") {
+      this.#record("hard_exhausted", ["costUsd"]);
+      throw new WorkflowError("BUDGET_EXHAUSTED", `Strict estimated cost is unknown (${this.#usage.costProvenance.reason})`);
+    }
+    const exhausted = dimensions.filter((dimension) => { const hard = this.budget?.[dimension]?.hard; return hard !== undefined && this.#usage[dimension] >= hard; }); if (!exhausted.length) return; this.#record("hard_exhausted", exhausted); const detail = exhausted.map((dimension) => `${dimension} usage=${String(this.#usage[dimension])} hard=${String(this.budget?.[dimension]?.hard)}`).join(", "); throw new WorkflowError("BUDGET_EXHAUSTED", `Budget version ${String(this.version)} exhausted: ${detail}`); }
   #evaluate(): void { const budget = this.budget; if (!budget) return; const entries = budgetEntries(budget); const soft = entries.filter(([dimension, limits]) => limits.soft !== undefined && this.#usage[dimension] >= limits.soft).map(([dimension]) => dimension); if (soft.length) this.#record("soft_crossed", soft); const overrun = entries.filter(([dimension, limits]) => limits.hard !== undefined && this.#usage[dimension] > limits.hard).map(([dimension]) => dimension); if (overrun.length) this.#record("hard_overrun", overrun); }
   #record(type: BudgetEvent["type"], dimensions: readonly BudgetDimension[]): void { if (this.#seen.has(type)) return; this.#seen.add(type); this.#events.push({ type, budgetVersion: this.version, dimensions: [...dimensions], usage: this.usage, limits: structuredClone(this.budget ?? {}), at: this.#now() }); this.#onChange?.(); }
   recordEvent(event: BudgetEvent): void { this.#events.push(structuredClone(event)); }

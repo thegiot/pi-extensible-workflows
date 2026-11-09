@@ -3,8 +3,9 @@ import { access, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile
 import { homedir } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { HARD_TERMINAL_RUN_STATES, WorkflowError, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, SETTLED_AGENT_STATES, WorkflowError, zeroAccounting, type AgentAccounting, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, loadLaunchSnapshot, object, positiveInteger, SerialLane } from "./utils.js";
+import { readStrictCost, STRICT_COST_SNAPSHOT_VERSION, type StrictCostLedger } from "./strict-cost.js";
 import { budgetUsage } from "./budget.js";
 import {
   decodeBooleanCheckpointResult, decodeBorrowedWorktreeBindings, decodeJournal, decodeLaunchSnapshot,
@@ -46,6 +47,7 @@ async function createSystemPromptStorage(directory: string, writeArtifact: boole
 
 export class RunStore {
   readonly directory: string;
+  strictCost?: StrictCostLedger;
   private journalLane = new SerialLane();
   // ponytail: serializes one RunStore instance; cross-process run sharing remains unsupported.
   private stateLane = new SerialLane();
@@ -104,6 +106,28 @@ export class RunStore {
     catch { return false; }
   }
 
+  async #strictCostStatus(run: PersistedRun, snapshotVersion?: number): Promise<PersistedRun> {
+    if (!run.budget?.costUsd?.requireProvenance && snapshotVersion !== STRICT_COST_SNAPSHOT_VERSION) return run;
+    const previous = budgetUsage(run.usage);
+    const costProvenance = previous.costProvenance?.status === "unknown"
+      ? previous.costProvenance
+      : this.strictCost?.snapshot() ?? await readStrictCost(this.directory);
+    const usage = { ...previous, costProvenance, costUsd: costProvenance.status === "unknown" ? previous.costUsd : costProvenance.usd };
+    if (this.strictCost || costProvenance.status !== "unknown") return { ...run, usage };
+    const recoveredAccounting = (accounting: AgentAccounting | undefined, unfinished: boolean): AgentAccounting =>
+      accounting?.costProvenance?.status === "unknown" || accounting?.costProvenance?.status === "estimated" && !unfinished
+        ? accounting
+        : { ...(accounting ?? zeroAccounting()), costProvenance };
+    const agents = run.agents.map((agent) => {
+      const unfinished = !SETTLED_AGENT_STATES.has(agent.state);
+      return { ...agent, accounting: recoveredAccounting(agent.accounting, unfinished),
+        ...(agent.attemptDetails ? { attemptDetails: agent.attemptDetails.map((attempt, index, all) => ({
+          ...attempt, accounting: recoveredAccounting(attempt.accounting, unfinished && index === all.length - 1),
+        })) } : {}) };
+    });
+    return { ...run, usage, agents };
+  }
+
   async load(): Promise<{ run: PersistedRun; snapshot: Readonly<LaunchSnapshot> }> {
     await this.stateLane.run(async () => undefined);
     const rawRun = await json(join(this.directory, "state.json"));
@@ -113,14 +137,14 @@ export class RunStore {
     if (!object(rawRun) || !Array.isArray(rawRun.agentSessions) || Object.hasOwn(rawRun, "nativeSessions")) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted run uses an unsupported agent session format");
     const snapshot = decodeLaunchSnapshot(await json(join(this.directory, "snapshot.json")));
     if (!snapshot) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted launch snapshot is invalid");
-    return { run, snapshot: loadLaunchSnapshot(snapshot) };
+    return { run: await this.#strictCostStatus(run, snapshot.identityVersion), snapshot: loadLaunchSnapshot(snapshot) };
   }
   async loadStatus(): Promise<PersistedRun> {
     await this.stateLane.run(async () => undefined);
     const run = decodePersistedRun(await json(join(this.directory, "state.json")), true);
     if (!run) throw new WorkflowError("RUN_NOT_FOUND", "Persisted run is invalid");
     this.#assertRunIdentity(run, "RUN_NOT_FOUND", "Persisted run does not belong to this project");
-    return run;
+    return this.#strictCostStatus(run);
   }
   async loadSummary(): Promise<RunSummary> {
     await this.stateLane.run(async () => undefined);
@@ -134,7 +158,7 @@ export class RunStore {
     const fallbackCreatedAt = new Date(stateStat.mtimeMs).toISOString();
     const previousUpdatedAt = previous?.updatedAt === undefined ? Number.NaN : Date.parse(previous.updatedAt);
     const updatedAt = new Date(Math.max(stateStat.mtimeMs, journalStat.mtimeMs, Number.isNaN(previousUpdatedAt) ? 0 : previousUpdatedAt)).toISOString();
-    return summaryFromRun(run, this.directory, journal, previous, fallbackCreatedAt, updatedAt);
+    return summaryFromRun(await this.#strictCostStatus(run), this.directory, journal, previous, fallbackCreatedAt, updatedAt);
   }
 
   async saveState(run: PersistedRun): Promise<void> {

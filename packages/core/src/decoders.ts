@@ -1,3 +1,4 @@
+import { decodeCostProvenance } from "./strict-cost.js";
 import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type AgentDefinition, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowExtensionSettings, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
 import type { OwnershipRecord, ScheduledAgentOptions } from "./agent-execution.js";
 import { finiteNumber, isThinkingLevel, isWorkflowErrorCode, jsonValue, object, positiveInteger, validWorkflowExtensionNamespace } from "./utils.js";
@@ -140,7 +141,11 @@ function decodeBudget(value: unknown): NonNullable<RunRecord["budget"]> | undefi
     if (raw === undefined) continue;
     const limits = decodeBudgetLimits(raw);
     if (limits === undefined) return undefined;
-    budget[dimension] = limits;
+    if (object(raw) && "requireProvenance" in raw) {
+      if (dimension !== "costUsd" || raw.requireProvenance !== true || limits.hard === undefined || limits.hard < 0 ||
+        limits.soft !== undefined && (limits.soft < 0 || limits.soft >= limits.hard)) return undefined;
+      budget.costUsd = { ...limits, hard: limits.hard, requireProvenance: true };
+    } else budget[dimension] = limits;
   }
   return budget;
 }
@@ -238,7 +243,9 @@ function decodeAgentSession(value: unknown): PersistedAgentSession | undefined {
 }
 function decodeAgentAccounting(value: unknown): AgentAccounting | undefined {
   if (!object(value) || !finiteNumber(value.input) || !finiteNumber(value.output) || !finiteNumber(value.cacheRead) || !finiteNumber(value.cacheWrite) || !finiteNumber(value.cost)) return undefined;
-  return { input: value.input, output: value.output, cacheRead: value.cacheRead, cacheWrite: value.cacheWrite, cost: value.cost };
+  const costProvenance = decodeCostProvenance(value.costProvenance);
+  if (value.costProvenance !== undefined && !costProvenance) return undefined;
+  return { input: value.input, output: value.output, cacheRead: value.cacheRead, cacheWrite: value.cacheWrite, cost: value.cost, ...(costProvenance ? { costProvenance } : {}) };
 }
 function decodeAgentActivity(value: unknown): AgentActivity | undefined {
   if (!object(value) || typeof value.text !== "string") return undefined;
@@ -365,7 +372,9 @@ function decodeWorkflowError(value: unknown): NonNullable<RunRecord["error"]> | 
 }
 function decodeUsage(value: unknown): WorkflowBudgetUsage | undefined {
   if (!object(value) || !finiteNumber(value.tokens) || !finiteNumber(value.costUsd) || !finiteNumber(value.durationMs) || !finiteNumber(value.agentLaunches)) return undefined;
-  return { tokens: value.tokens, costUsd: value.costUsd, durationMs: value.durationMs, agentLaunches: value.agentLaunches };
+  const costProvenance = decodeCostProvenance(value.costProvenance);
+  if (value.costProvenance !== undefined && !costProvenance) return undefined;
+  return { tokens: value.tokens, costUsd: value.costUsd, ...(costProvenance ? { costProvenance } : {}), durationMs: value.durationMs, agentLaunches: value.agentLaunches };
 }
 function decodeBudgetEvent(value: unknown): BudgetEvent | undefined {
   if (!object(value) || !isBudgetEventType(value.type) || !integer(value.budgetVersion) || !finiteNumber(value.at)) return undefined;

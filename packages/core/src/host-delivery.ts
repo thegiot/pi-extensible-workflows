@@ -110,6 +110,7 @@ const WORKFLOW_ERROR_PROSE: Record<WorkflowErrorCode, (detail: string) => string
   WORKER_UNRESPONSIVE: (detail) => `The workflow worker stopped responding: ${detail}.`,
   WORKTREE_FAILED: (detail) => `The workflow worktree operation failed: ${detail}.`,
   RESUME_INCOMPATIBLE: (detail) => `The workflow cannot resume this run: ${detail}.`,
+  COST_PROVENANCE_UNAVAILABLE: (detail) => `Strict estimated cost is unavailable: ${detail}.`,
   BUDGET_EXHAUSTED: (detail) => `The workflow budget was exhausted: ${detail}.`,
   INTERNAL_ERROR: (detail) => `The workflow encountered an internal error: ${detail}.`,
 };

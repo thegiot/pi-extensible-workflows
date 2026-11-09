@@ -18,7 +18,7 @@ import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type { AgentRecord, AgentState, RunRecord, RunState } from "./types.js";
+import type { AgentRecord, AgentState, CostProvenance, RunRecord, RunState } from "./types.js";
 import { listRunIds, RunStore } from "./persistence.js";
 import {
   BUDGET_DIMENSIONS,
@@ -199,6 +199,7 @@ interface ReceiptAgent {
   output: number;
   cacheRead: number;
   costUsd: number;
+  costProvenance?: CostProvenance;
   durationMs: number;
   attempts: number;
 }
@@ -208,6 +209,7 @@ interface Receipt {
   workflow: string;
   state: string;
   costUsd: number;
+  costProvenance?: CostProvenance;
   tokens: number;
   durationMs: number;
   phases: readonly string[];
@@ -244,8 +246,11 @@ export function formatTokens(tokens: number | undefined): string {
   return `${thousands < 10 ? thousands.toFixed(1) : String(Math.round(thousands))}kt`;
 }
 
-export function formatCost(cost: number | undefined): string {
-  if (!cost) return "";
+export function formatCost(cost: number | undefined, provenance?: CostProvenance): string {
+  if (provenance?.status === "unknown") return "cost unknown";
+  if (provenance?.status === "pending") return "cost pending";
+  if (provenance?.status === "estimated") cost = provenance.usd;
+  if (!cost) return provenance ? "$0.00" : "";
   // Three decimals below a cent: at two, every cheap agent reads as $0.00 and
   // the per-agent column becomes a row of zeroes.
   return cost < 0.01 ? `$${cost.toFixed(3)}` : `$${cost.toFixed(2)}`;
@@ -581,7 +586,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
 
   const rows: Row[] = [];
   for (const run of live) {
-    const stats = [formatTokens(run.usage?.tokens), formatCost(run.usage?.costUsd)]
+    const stats = [formatTokens(run.usage?.tokens), formatCost(run.usage?.costUsd, run.usage?.costProvenance)]
       .filter(Boolean)
       .join(" · ");
     const budget = budgetWarning(run);
@@ -623,7 +628,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
         cost += agent.accounting?.cost ?? 0;
         tokens += agentTokens(agent);
       }
-      const phaseStats = [formatTokens(tokens), formatCost(cost)].filter(Boolean).join(" · ");
+      const phaseStats = [formatTokens(tokens), run.usage?.costProvenance ? "" : formatCost(cost)].filter(Boolean).join(" · ");
 
       const phaseKey = `${runKey}/phase:${String(index)}`;
       rows.push({
@@ -669,7 +674,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
         const detail = [
           `${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`,
           formatTokens(agentTokens(agent)),
-          formatCost(agent.accounting?.cost),
+          formatCost(agent.accounting?.cost, agent.accounting?.costProvenance),
           formatElapsed(
             agentLive && agent.startedAt ? now - agent.startedAt : (agent.durationMs ?? 0),
           ),
@@ -841,6 +846,7 @@ function receiptFor(run: Run, fallback?: { message?: string }): Receipt {
     workflow: run.workflowName ?? "workflow",
     state: run.state ?? "completed",
     costUsd: run.usage?.costUsd ?? 0,
+    ...(run.usage?.costProvenance ? { costProvenance: run.usage.costProvenance } : {}),
     tokens: run.usage?.tokens ?? 0,
     durationMs: run.usage?.durationMs ?? 0,
     phases: slices.map(({ phase }) => phase),
@@ -868,6 +874,7 @@ function receiptFor(run: Run, fallback?: { message?: string }): Receipt {
       output: agent.accounting?.output ?? 0,
       cacheRead: agent.accounting?.cacheRead ?? 0,
       costUsd: agent.accounting?.cost ?? 0,
+      ...(agent.accounting?.costProvenance ? { costProvenance: agent.accounting.costProvenance } : {}),
       durationMs: agent.durationMs ?? 0,
       attempts: agent.attempts,
     })),
@@ -886,7 +893,7 @@ export function renderReceipt(data: Receipt, expanded: boolean, theme: Theme): s
 
   const headline = [
     formatTokens(data.tokens),
-    formatCost(data.costUsd) || "$0.00",
+    formatCost(data.costUsd, data.costProvenance) || "$0.00",
     formatElapsed(data.durationMs),
     data.state,
   ]
@@ -911,7 +918,7 @@ export function renderReceipt(data: Receipt, expanded: boolean, theme: Theme): s
       tokens += agent.input + agent.output;
     }
     const state = agents.some((agent) => agent.state === "failed") ? "failed" : "completed";
-    const stats = [formatTokens(tokens), formatCost(cost)].filter(Boolean).join(" · ");
+    const stats = [formatTokens(tokens), data.costProvenance ? "" : formatCost(cost)].filter(Boolean).join(" · ");
 
     lines.push(
       `${last ? "╰─" : "├─"} ${glyph(state)} ${phase}${stats ? theme.fg("muted", `  ${stats}`) : ""}`,
@@ -932,7 +939,7 @@ export function renderReceipt(data: Receipt, expanded: boolean, theme: Theme): s
     const drawAgent = (agent: ReceiptAgent, prefix: string, lastAgent: boolean): void => {
       const detail = [
         agent.model ?? "",
-        formatCost(agent.costUsd),
+        formatCost(agent.costUsd, agent.costProvenance),
         formatElapsed(agent.durationMs),
         // A run that only succeeded on the third try cost three times what its
         // final attempt suggests.

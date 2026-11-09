@@ -25,6 +25,7 @@ export type WorkflowRunRecord = {
   providerErrorRecovery?: (failure: AgentProviderFailure) => Promise<AgentProviderRecovery>;
   execution?: WorkflowExecution;
   completion?: Promise<unknown>;
+  strictTerminalState?: "stopped" | "interrupted";
   foreground?: boolean;
   checkpointResolvers: Map<string, { resolve: (value: boolean) => void; reject: (reason: unknown) => void; signal: AbortSignal; policy: boolean; notified?: boolean }>;
   update?: (result: WorkflowToolUpdate) => void;

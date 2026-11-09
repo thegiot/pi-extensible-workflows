@@ -1,3 +1,4 @@
+import { STRICT_COST_SNAPSHOT_VERSION } from "./strict-cost.js";
 import { randomUUID } from "node:crypto";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -60,8 +61,14 @@ function workflowRecoveryGuidance(action: "resume" | "retry", state: RunState): 
   if (state === "interrupted") return "Interrupted workflow runs must be resumed from the interactive /workflow picker";
   return `Only failed workflow runs can be retried; source is ${state}`;
 }
+function assertStrictCostRecoveryDisabled(snapshot: Readonly<LaunchSnapshot>): void {
+  if (snapshot.identityVersion === STRICT_COST_SNAPSHOT_VERSION || snapshot.budget?.costUsd?.requireProvenance) {
+    throw new WorkflowError("RESUME_INCOMPATIBLE", "Strict cost workflows cannot be resumed or retried");
+  }
+}
 /** A snapshot can only be re-executed when it carries the current identity scheme and every role its script references. */
 function assertResumableSnapshot(snapshot: Readonly<LaunchSnapshot>, trustedProject: boolean): void {
+  assertStrictCostRecoveryDisabled(snapshot);
   if (snapshot.identityVersion !== LAUNCH_SNAPSHOT_IDENTITY_VERSION && snapshot.identityVersion !== LEGACY_CHECKPOINT_IDENTITY_VERSION) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow launch snapshot identity version is incompatible");
   if (snapshot.roles === undefined) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow role definitions are missing from the launch snapshot");
   if ((snapshot.projectRoles?.length ?? 0) > 0 && !trustedProject) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot restore project roles in an untrusted project");
@@ -206,7 +213,9 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
       const { cwd, sessionId } = hostSessionContext(context);
       if (cwd && sessionId) {
         try {
-          const state = (await new RunStore(cwd, sessionId, runId, home).load()).run.state;
+          const loaded = await new RunStore(cwd, sessionId, runId, home).load();
+          assertStrictCostRecoveryDisabled(loaded.snapshot);
+          const state = loaded.run.state;
           assertExpectedWorkflowState(expectedState, state);
           throw new WorkflowError("RESUME_INCOMPATIBLE", workflowRecoveryGuidance("resume", state));
         } catch (error) {
@@ -217,6 +226,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     }
     const loaded = await run.store.load();
     assertExpectedWorkflowState(expectedState, loaded.run.state);
+    assertStrictCostRecoveryDisabled(loaded.snapshot);
     if (loaded.run.state !== "budget_exhausted") throw new WorkflowError("RESUME_INCOMPATIBLE", workflowRecoveryGuidance("resume", loaded.run.state));
     const currentBudget = validateBudget(loaded.run.budget ?? loaded.snapshot.budget);
     const patch = rawPatch === undefined ? {} : validateBudgetPatch(rawPatch);
