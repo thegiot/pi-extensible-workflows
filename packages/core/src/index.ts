@@ -28,3 +28,8 @@ export * from "./herdr.js";
 export * from "./runtime/index.js";
 export { retainTerminalRuns } from "./retention.js";
 export type { RetentionCleanupOptions, RetentionCleanupReport } from "./retention.js";
+
+export { approveStrictCost } from "./strict-cost-openai.js";
+export type { StrictCostOpenAI } from "./strict-cost-openai.js";
+export { STRICT_COST_MODEL } from "./strict-cost.js";
+export type { ApprovedCostTariff } from "./strict-cost.js";

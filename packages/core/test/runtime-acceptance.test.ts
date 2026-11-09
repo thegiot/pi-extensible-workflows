@@ -361,7 +361,7 @@ void test("cold recovery delivers a persisted checkpoint only once before replay
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   const script = `export const meta={name:'cold-gate',description:'cold gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`;
-  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], agentSessions: [], error: { code: "CANCELLED", message: "interrupted" } }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], agentSessions: [], error: { code: "CANCELLED", message: "interrupted" } }, createLaunchSnapshot({ identityVersion: 5, script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   await store.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: { sha: "abc" } });
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { accepted: boolean } }> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -373,13 +373,11 @@ void test("cold recovery delivers a persisted checkpoint only once before replay
   assert.ok(start && command && shutdown);
   await start({}, ctx);
   assert.match(messages[0] ?? "", /Ship\?/);
-  await contextualWorkflowAction(command, ctx, "run-a", "Resume", "Background");
-  await waitForRunState(store, "awaiting_input");
-  assert.equal(messages.length, 1);
   const respond = tools.find(({ name }) => name === "workflow_respond");
   assert.ok(respond);
   const response = await executeToolCall(respond, "respond", { runId: "run-a", name: "ship", approved: true }, testExtensionContextFor(ctx)) as { details: { accepted: boolean } };
   assert.equal(response.details.accepted, true);
+  await contextualWorkflowAction(command, ctx, "run-a", "Resume", "Background");
   await waitForRunState(store, "completed");
   assert.equal((await store.load()).run.state, "completed");
   assert.deepEqual(await store.replay("checkpoint/ship"), {

@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type ExtensionUIContext, SettingsManager, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { listRunIds, RunStore, type AwaitingCheckpoint, type PersistedRun, type WorktreeReference } from "./persistence.js";
+import { listRunIds, RunStore, type AwaitingCheckpoint, type CheckpointSelector, type PersistedRun, type WorktreeReference } from "./persistence.js";
 import { type WorkflowRegistryApi } from "./registry.js";
 import { deepFreeze, errorText, object, resolveModelReference, validateModelAliases } from "./utils.js";
 import { saveModelAliases, resolveWorkflowSettings, workflowProjectSettingsPath, workflowSettingsPath } from "./validation.js";
@@ -170,7 +170,7 @@ export type WorkflowNavigatorDependencies = {
   terminalRunStates: Map<string, HardTerminalRunState>;
   hardTerminalRunStates: ReadonlySet<string>;
   ensureSessionLease: (cwd: string, sessionId: string) => Promise<void>;
-  answerCheckpoint: (runId: string, name: string, approved: boolean, silent?: boolean) => Promise<boolean>;
+  answerCheckpoint: (runId: string, selector: CheckpointSelector, approved: boolean, silent?: boolean) => Promise<boolean>;
   recovery: ReturnType<typeof createWorkflowRecovery>;
   stopWorkflowRun: (runId: string) => Promise<{ runId: string; state: string; stopped: boolean; reason?: "unknown_run" | "already_terminal" }>;
   moveForegroundToBackground: (runId: string) => Promise<{ runId: string; state: "running"; detached: true }>;
@@ -238,9 +238,11 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
             ctx.ui.notify(`Moved workflow ${result.runId} to background.`, "info");
             return "dashboard";
           }
-          if ((action === "approve" || action === "reject") && runId && rest.length) {
-            const accepted = await answerCheckpoint(runId, rest.join(" "), action === "approve", true);
-            ctx.ui.notify(accepted ? `${action === "approve" ? "Approved" : "Rejected"} checkpoint ${rest.join(" ")}.` : "Checkpoint is not awaiting a response.", accepted ? "info" : "warning");
+          if ((action === "approve" || action === "reject" || action === "approve-occurrence" || action === "reject-occurrence") && runId && rest[0]) {
+            const approved = action.startsWith("approve");
+            const selector = action.endsWith("-occurrence") ? { occurrenceId: rest[0] } : rest.join(" ");
+            const accepted = await answerCheckpoint(runId, selector, approved, true);
+            ctx.ui.notify(accepted ? `${approved ? "Approved" : "Rejected"} checkpoint.` : "Checkpoint is not awaiting a response.", accepted ? "info" : "warning");
             return "dashboard";
           }
           if ((action === "budget-approve" || action === "budget-reject") && runId && rest[0]) {
@@ -471,13 +473,18 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
             if (isForegroundAttached(store.runId)) actions.set("Move to background", `background ${store.runId}`);
             if (!terminalStates.has(liveRun.state)) add("Stop", "stop");
             for (const cp of checkpoints) {
+              const actionPrefix = ctx.mode === "tui" ? "Review" : "Approve";
+              let display = cp.name;
+              for (let suffix = 2; actions.has(`${actionPrefix} ${display}`); suffix += 1) display = `${cp.name} [${String(suffix)}]`;
               if (ctx.mode === "tui") {
-                const label = `Review ${cp.name}`;
+                const label = `Review ${display}`;
                 actions.set(label, "review");
                 reviews.set(label, cp);
               } else {
-                actions.set(`Approve ${cp.name}`, `approve ${store.runId} ${cp.name}`);
-                actions.set(`Reject ${cp.name}`, `reject ${store.runId} ${cp.name}`);
+                const suffix = cp.occurrenceId === undefined ? "" : "-occurrence";
+                const selector = cp.occurrenceId ?? cp.name;
+                actions.set(`Approve ${display}`, `approve${suffix} ${store.runId} ${selector}`);
+                actions.set(`Reject ${display}`, `reject${suffix} ${store.runId} ${selector}`);
               }
             }
             if (ctx.mode !== "tui") actions.set("Refresh", "refresh");
@@ -890,7 +897,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
                 }, theme);
               }, { overlay: true, overlayOptions: WORKFLOW_OVERLAY_OPTIONS });
               if (decision) {
-                const accepted = await answerCheckpoint(store.runId, checkpoint.name, decision === "Approve", true);
+                const accepted = await answerCheckpoint(store.runId, checkpoint.occurrenceId === undefined ? checkpoint.name : { occurrenceId: checkpoint.occurrenceId }, decision === "Approve", true);
                 if (!accepted) ctx.ui.notify("Checkpoint is not awaiting a response.", "warning");
               }
               continue;

@@ -1,3 +1,4 @@
+import type { CostProvenance } from "../types.js";
 export type RuntimeJsonValue = null | boolean | number | string | RuntimeJsonValue[] | { [key: string]: RuntimeJsonValue };
 export type RuntimeJsonSchema = { [key: string]: RuntimeJsonValue };
 
@@ -34,6 +35,7 @@ export interface RuntimeUsage {
   readonly cacheRead?: number;
   readonly cacheWrite?: number;
   readonly costUsd?: number;
+  readonly costProvenance?: CostProvenance;
 }
 
 export type RuntimeAgentProviderRecovery = "retry" | "abort" | { readonly model: string };

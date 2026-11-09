@@ -203,10 +203,16 @@ type StaticWorkflowContext = { execution: StaticWorkflowExecution; structure: re
 const INTERNAL_AGENT_NAME = "__pi_extensible_workflows_agent";
 const INTERNAL_WORKTREE_NAME = "__pi_extensible_workflows_withWorktree";
 const INTERNAL_SHELL_NAME = "__pi_extensible_workflows_shell";
-const RESERVED_IDENTIFIERS = [[INTERNAL_AGENT_NAME, "agent"], [INTERNAL_WORKTREE_NAME, "withWorktree"], [INTERNAL_SHELL_NAME, "shell"]] as const;
+const INSTRUMENTED_CALLS = {
+  agent: INTERNAL_AGENT_NAME,
+  withWorktree: INTERNAL_WORKTREE_NAME,
+  shell: INTERNAL_SHELL_NAME,
+  checkpoint: "__pi_extensible_workflows_checkpoint",
+} as const;
+const RESERVED_IDENTIFIERS = Object.entries(INSTRUMENTED_CALLS);
 /** Workflow source must not mention the identifiers instrumentation rewrites primitive calls into. */
 function assertNoReservedIdentifiers(program: acorn.Program): void {
-  for (const [name, primitive] of RESERVED_IDENTIFIERS) if (hasIdentifier(program, name)) fail("INVALID_METADATA", `${name} is reserved for workflow ${primitive} instrumentation`);
+  for (const [primitive, name] of RESERVED_IDENTIFIERS) if (hasIdentifier(program, name)) fail("INVALID_METADATA", `${name} is reserved for workflow ${primitive} instrumentation`);
 }
 
 function callHasTrailingComma(source: string, call: WorkflowCall): boolean {
@@ -219,17 +225,55 @@ function callHasTrailingComma(source: string, call: WorkflowCall): boolean {
   return current?.type.label === ")" && previous?.type.label === ",";
 }
 
+function isLoop(node: acorn.AnyNode): boolean {
+  return node.type === "ForStatement" || node.type === "ForOfStatement" || node.type === "ForInStatement" || node.type === "WhileStatement" || node.type === "DoWhileStatement";
+}
+
+/** Count runtime scopes for direct checkpoint sites whose function ancestors are named, non-repeated callbacks. */
+function checkpointScopeDepths(program: acorn.Program): ReadonlyMap<number, number> {
+  const depths = new Map<number, number>();
+  const branchFunctions = new Map<acorn.AnyNode, number>();
+  const visit = (node: acorn.AnyNode, depth: number | undefined, repeated = false): void => {
+    const inLoop = repeated || isLoop(node);
+    let scopeDepth = depth;
+    if (node.type === "ArrowFunctionExpression" || node.type === "FunctionExpression" || node.type === "FunctionDeclaration") {
+      const increment = branchFunctions.get(node);
+      scopeDepth = scopeDepth === undefined || increment === undefined ? undefined : scopeDepth + increment;
+    }
+    if (isWorkflowCall(node)) {
+      const kind = node.callee.name;
+      if (kind === "checkpoint" && scopeDepth !== undefined) depths.set(node.start, scopeDepth);
+      if (!inLoop && kind === "withWorktree" && node.arguments[1]?.type === "ArrowFunctionExpression") branchFunctions.set(node.arguments[1], 0);
+      if (!inLoop && (kind === "parallel" || kind === "pipeline")) {
+        const branches = node.arguments[kind === "parallel" ? 1 : 2];
+        if (branches?.type === "ObjectExpression") {
+          for (const property of branches.properties) if (property.type === "Property" && property.value.type === "ArrowFunctionExpression") branchFunctions.set(property.value, 1);
+        }
+      }
+    }
+    for (const child of astChildren(node)) visit(child, scopeDepth, inLoop);
+  };
+  visit(program, 0);
+  return depths;
+}
+
 export function instrumentWorkflow(script: string): string {
   const body = workflowBody(script);
   if (!body.trim()) return body;
   const program = parseWorkflow(body);
   assertNoReservedIdentifiers(program);
   validateRemovedWorkflowPrimitives(program, "INVALID_METADATA");
-  const calls = workflowCalls(program).filter((call) => ["agent", "withWorktree", "shell"].includes(call.callee.name));
-  const edits = calls.flatMap((call) => {
-    const replacement = { start: call.callee.start, end: call.callee.end, text: call.callee.name === "agent" ? INTERNAL_AGENT_NAME : call.callee.name === "withWorktree" ? INTERNAL_WORKTREE_NAME : INTERNAL_SHELL_NAME };
+  const checkpointDepths = checkpointScopeDepths(program);
+  const edits = workflowCalls(program).flatMap((call) => {
+    const primitive = RESERVED_IDENTIFIERS.find(([name]) => name === call.callee.name);
+    if (!primitive) return [];
+    const replacement = { start: call.callee.start, end: call.callee.end, text: primitive[1] };
     if (call.callee.name === "withWorktree") return [replacement];
     const callSite = `${String(call.start)}:${String(call.end)}`;
+    if (call.callee.name === "checkpoint") {
+      const depth = checkpointDepths.get(call.start) ?? null;
+      return [{ ...replacement, text: `${replacement.text}(checkpoint, ${JSON.stringify(callSite)}, ${String(depth)})` }];
+    }
     const hiddenArgument = call.arguments.length === 0 || callHasTrailingComma(body, call) ? "" : ", ";
     return [replacement, { start: call.end - 1, end: call.end - 1, text: `${hiddenArgument}${JSON.stringify(callSite)}` }];
   }).sort((left, right) => right.start - left.start);
@@ -388,6 +432,26 @@ function callArgument(call: acorn.CallExpression, index: number): acorn.AnyNode 
 function staticString(node: acorn.AnyNode | undefined): string | null {
   const value = staticValue(node);
   return value.known && typeof value.value === "string" ? value.value : null;
+}
+
+/** Legacy records have no call site. Prove which static names have a single non-repeated site. */
+export function uniqueLegacyCheckpointNames(script: string): ReadonlySet<string> {
+  const program = parseWorkflow(workflowBody(script));
+  try { validateDirectPrimitiveReferences(program, "checkpoint"); } catch { return new Set(); }
+  const names = new Map<string, number>();
+  const unknown = { present: false };
+  const visit = (node: acorn.AnyNode, repeated: boolean): void => {
+    if (node.type === "ThisExpression" || node.type === "Identifier" && node.name === "globalThis") unknown.present = true;
+    const repeatable = repeated || node.type === "ArrowFunctionExpression" || node.type === "FunctionExpression" || node.type === "FunctionDeclaration" || isLoop(node);
+    if (isWorkflowCall(node) && node.callee.name === "checkpoint") {
+      const name = staticString(propertyNode(callArgument(node, 0), "name"));
+      if (name === null) unknown.present = true;
+      else names.set(name, (names.get(name) ?? 0) + (repeatable ? 2 : 1));
+    }
+    for (const child of astChildren(node)) visit(child, repeatable);
+  };
+  visit(program, false);
+  return unknown.present ? new Set() : new Set([...names].filter(([, count]) => count === 1).map(([name]) => name));
 }
 
 export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {

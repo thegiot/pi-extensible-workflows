@@ -1,20 +1,23 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { isDeepStrictEqual } from "node:util";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { HARD_TERMINAL_RUN_STATES, WorkflowError, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, SETTLED_AGENT_STATES, WorkflowError, zeroAccounting, type AgentAccounting, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, loadLaunchSnapshot, object, positiveInteger, SerialLane } from "./utils.js";
+import { readStrictCost, STRICT_COST_SNAPSHOT_VERSION, type StrictCostLedger } from "./strict-cost.js";
 import { budgetUsage } from "./budget.js";
 import {
   decodeBooleanCheckpointResult, decodeBorrowedWorktreeBindings, decodeJournal, decodeLaunchSnapshot,
   decodeOwnershipRecords, decodePersistedRun, decodeSummaryProjection, decodeSystemPromptArtifact,
   decodeWorktreeReferences,
-  type AwaitingCheckpoint, type BorrowedWorktreeBinding, type CheckpointDecisionProvenance, type CompletedOperation, type EffectiveSystemPrompt,
+  type AwaitingCheckpoint, type BorrowedWorktreeBinding, type CheckpointDecisionProvenance, type CheckpointSelector, type CompletedOperation, type EffectiveSystemPrompt, type LiveCheckpoint,
   type Journal, type PendingWorkflowDecision, type PersistedOwnershipNode,
   type PersistedRun, type RunSummary, type RunSummaryArtifacts, type WorktreeReference,
 } from "./decoders.js";
 import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json } from "./io.js";
 import { runsDirectory, safePart, structuralPath } from "./paths.js";
+import { uniqueLegacyCheckpointNames } from "./validation.js";
 
 const SYSTEM_PROMPT_STORAGE = ".system-prompts";
 const SYSTEM_PROMPT_RECORDS = "records";
@@ -44,6 +47,7 @@ async function createSystemPromptStorage(directory: string, writeArtifact: boole
 
 export class RunStore {
   readonly directory: string;
+  strictCost?: StrictCostLedger;
   private journalLane = new SerialLane();
   // ponytail: serializes one RunStore instance; cross-process run sharing remains unsupported.
   private stateLane = new SerialLane();
@@ -102,6 +106,28 @@ export class RunStore {
     catch { return false; }
   }
 
+  async #strictCostStatus(run: PersistedRun, snapshotVersion?: number): Promise<PersistedRun> {
+    if (!run.budget?.costUsd?.requireProvenance && snapshotVersion !== STRICT_COST_SNAPSHOT_VERSION) return run;
+    const previous = budgetUsage(run.usage);
+    const costProvenance = previous.costProvenance?.status === "unknown"
+      ? previous.costProvenance
+      : this.strictCost?.snapshot() ?? await readStrictCost(this.directory);
+    const usage = { ...previous, costProvenance, costUsd: costProvenance.status === "unknown" ? previous.costUsd : costProvenance.usd };
+    if (this.strictCost || costProvenance.status !== "unknown") return { ...run, usage };
+    const recoveredAccounting = (accounting: AgentAccounting | undefined, unfinished: boolean): AgentAccounting =>
+      accounting?.costProvenance?.status === "unknown" || accounting?.costProvenance?.status === "estimated" && !unfinished
+        ? accounting
+        : { ...(accounting ?? zeroAccounting()), costProvenance };
+    const agents = run.agents.map((agent) => {
+      const unfinished = !SETTLED_AGENT_STATES.has(agent.state);
+      return { ...agent, accounting: recoveredAccounting(agent.accounting, unfinished),
+        ...(agent.attemptDetails ? { attemptDetails: agent.attemptDetails.map((attempt, index, all) => ({
+          ...attempt, accounting: recoveredAccounting(attempt.accounting, unfinished && index === all.length - 1),
+        })) } : {}) };
+    });
+    return { ...run, usage, agents };
+  }
+
   async load(): Promise<{ run: PersistedRun; snapshot: Readonly<LaunchSnapshot> }> {
     await this.stateLane.run(async () => undefined);
     const rawRun = await json(join(this.directory, "state.json"));
@@ -111,14 +137,14 @@ export class RunStore {
     if (!object(rawRun) || !Array.isArray(rawRun.agentSessions) || Object.hasOwn(rawRun, "nativeSessions")) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted run uses an unsupported agent session format");
     const snapshot = decodeLaunchSnapshot(await json(join(this.directory, "snapshot.json")));
     if (!snapshot) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted launch snapshot is invalid");
-    return { run, snapshot: loadLaunchSnapshot(snapshot) };
+    return { run: await this.#strictCostStatus(run, snapshot.identityVersion), snapshot: loadLaunchSnapshot(snapshot) };
   }
   async loadStatus(): Promise<PersistedRun> {
     await this.stateLane.run(async () => undefined);
     const run = decodePersistedRun(await json(join(this.directory, "state.json")), true);
     if (!run) throw new WorkflowError("RUN_NOT_FOUND", "Persisted run is invalid");
     this.#assertRunIdentity(run, "RUN_NOT_FOUND", "Persisted run does not belong to this project");
-    return run;
+    return this.#strictCostStatus(run);
   }
   async loadSummary(): Promise<RunSummary> {
     await this.stateLane.run(async () => undefined);
@@ -132,7 +158,7 @@ export class RunStore {
     const fallbackCreatedAt = new Date(stateStat.mtimeMs).toISOString();
     const previousUpdatedAt = previous?.updatedAt === undefined ? Number.NaN : Date.parse(previous.updatedAt);
     const updatedAt = new Date(Math.max(stateStat.mtimeMs, journalStat.mtimeMs, Number.isNaN(previousUpdatedAt) ? 0 : previousUpdatedAt)).toISOString();
-    return summaryFromRun(run, this.directory, journal, previous, fallbackCreatedAt, updatedAt);
+    return summaryFromRun(await this.#strictCostStatus(run), this.directory, journal, previous, fallbackCreatedAt, updatedAt);
   }
 
   async saveState(run: PersistedRun): Promise<void> {
@@ -276,7 +302,10 @@ export class RunStore {
       const journal = await this.#decodeJournal();
       journal.awaiting ??= {};
       const result = await update(journal);
-      await atomicJson(join(this.directory, "journal.json"), journal);
+      // An array is intentionally incompatible with the legacy decoder, which could otherwise answer
+      // a versioned occurrence by its display name before checking the launch snapshot on resume.
+      const persisted = journal.checkpointVersion === 1 ? { ...journal, awaiting: Object.values(journal.awaiting ?? {}) } : journal;
+      await atomicJson(join(this.directory, "journal.json"), persisted);
       this.refreshSummaryBestEffort();
       return result;
     });
@@ -361,6 +390,63 @@ export class RunStore {
     });
   }
 
+  /** Legacy keys encode just one label. A numeric suffix can denote a repeat or a literal name. */
+  static isLegacyCheckpointPath(path: string): boolean { return /^checkpoint\/[^/]+$/.test(path); }
+  static isAmbiguousLegacyCheckpointName(name: string): boolean { return /#(?:[2-9]|[1-9][0-9]+)$/.test(name); }
+
+  async validateCheckpointHistory(seen = new Set<string>()): Promise<void> {
+    if (seen.has(this.runId)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance contains a cycle");
+    seen.add(this.runId);
+    const journal = await this.#readJournal();
+    const { run, snapshot } = await this.load();
+    if (journal.checkpointReplayBlocked) throw new WorkflowError("RESUME_INCOMPATIBLE", "Checkpoint order cannot be proven for recovery. Start a new run with direct checkpoint calls in separate named branches.");
+    const legacy = Object.values(journal.completed).filter(({ path }) => RunStore.isLegacyCheckpointPath(path));
+    const legacyNames = legacy.length ? uniqueLegacyCheckpointNames(snapshot.script) : new Set<string>();
+    if (legacy.some(({ path, checkpoint }) => !checkpoint || !legacyNames.has(checkpoint.name)
+        || RunStore.isAmbiguousLegacyCheckpointName(checkpoint.name) || path !== structuralPath("checkpoint", checkpoint.name))
+        || Object.values(journal.awaiting ?? {}).some(({ path, name }) => RunStore.isLegacyCheckpointPath(path) && RunStore.isAmbiguousLegacyCheckpointName(name))) {
+      throw new WorkflowError("RESUME_INCOMPATIBLE", "Historical checkpoint labels cannot be disambiguated. Start a new run for a fresh decision.");
+    }
+    if (run.retry?.sourceRunId) await (await this.sourceRun(run.retry.sourceRunId)).validateCheckpointHistory(seen);
+  }
+
+  /** A new execution only accepts the waits it actually reaches, with fresh response IDs. */
+  async supersedeCheckpointWaits(): Promise<void> {
+    await this.updateJournal((journal) => {
+      const awaiting = Object.values(journal.awaiting ?? {});
+      if (awaiting.length === 0) return;
+      journal.supersededCheckpointNames = [...new Set([...(journal.supersededCheckpointNames ?? []), ...awaiting.map(({ name }) => name)])];
+      journal.awaiting = {};
+      journal.checkpointVersion = 1;
+    });
+  }
+
+  async registerCheckpoint(checkpoint: AwaitingCheckpoint, legacyPath: string | undefined, unprovenReplay: boolean, canRegister: () => boolean): Promise<boolean | LiveCheckpoint> {
+    const replayed = await this.replay(checkpoint.path) ?? (legacyPath === undefined ? undefined : await this.replay(legacyPath));
+    const replayDecision = (operation: CompletedOperation): boolean => {
+      const result = decodeBooleanCheckpointResult(operation.value);
+      if (result === undefined || operation.checkpoint?.prompt !== checkpoint.prompt || !isDeepStrictEqual(operation.checkpoint.context, checkpoint.context)) {
+        throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted checkpoint does not match the current prompt and context");
+      }
+      return result;
+    };
+    return this.updateJournal((journal) => {
+      if (!canRegister()) throw new WorkflowError("CANCELLED", "Workflow cannot register a checkpoint after stopping");
+      const completed = journal.completed[checkpoint.path] ?? replayed;
+      if (completed) {
+        if (unprovenReplay) throw new WorkflowError("RESUME_INCOMPATIBLE", "Checkpoint order cannot be proven for recovery");
+        return replayDecision(completed);
+      }
+      const awaiting = journal.awaiting ?? (journal.awaiting = {});
+      if (awaiting[checkpoint.path]) throw new WorkflowError("RESUME_INCOMPATIBLE", "Checkpoint structural occurrence is already awaiting input");
+      const pending: LiveCheckpoint = { ...checkpoint, occurrenceId: randomUUID() };
+      awaiting[pending.path] = pending;
+      journal.checkpointVersion = 1;
+      if (unprovenReplay) journal.checkpointReplayBlocked = true;
+      return pending;
+    });
+  }
+
   async awaitingCheckpoints(): Promise<readonly AwaitingCheckpoint[]> {
     return Object.values((await this.#readJournal()).awaiting ?? {});
   }
@@ -380,10 +466,14 @@ export class RunStore {
     });
   }
 
-  async answerCheckpoint(name: string, approved: boolean, provenance?: CheckpointDecisionProvenance): Promise<AwaitingCheckpoint | undefined> {
+  async answerCheckpoint(selector: CheckpointSelector, approved: boolean, provenance?: CheckpointDecisionProvenance, owns?: (checkpoint: AwaitingCheckpoint) => boolean): Promise<AwaitingCheckpoint | undefined> {
     return this.updateJournal((journal) => {
-      const checkpoint = Object.values(journal.awaiting ?? {}).find((item) => item.name === name);
-      if (!checkpoint || journal.completed[checkpoint.path]) return undefined;
+      const byName = typeof selector === "string";
+      const matches = Object.values(journal.awaiting ?? {}).filter((item) => byName ? item.name === selector : item.occurrenceId === selector.occurrenceId);
+      const [checkpoint] = matches;
+      if (matches.length !== 1 || !checkpoint || journal.completed[checkpoint.path]) return undefined;
+      if (byName && (journal.supersededCheckpointNames?.includes(selector) || Object.values(journal.completed).some((item) => item.checkpoint?.name === selector))) return undefined;
+      if (checkpoint.occurrenceId !== undefined && !owns || owns && !owns(checkpoint)) return undefined;
       journal.completed[checkpoint.path] = {
         path: checkpoint.path,
         value: approved,
@@ -391,10 +481,11 @@ export class RunStore {
           name: checkpoint.name,
           prompt: checkpoint.prompt,
           context: checkpoint.context,
-          ...(provenance !== undefined ? { provenance } : {}),
+          ...(checkpoint.occurrenceId === undefined ? {} : { occurrenceId: checkpoint.occurrenceId }),
+          ...(provenance === undefined ? {} : { provenance }),
         },
       };
-      journal.awaiting = Object.fromEntries(Object.entries(journal.awaiting ?? {}).filter(([path]) => path !== checkpoint.path));
+      delete journal.awaiting?.[checkpoint.path];
       return checkpoint;
     });
   }

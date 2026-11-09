@@ -1,3 +1,4 @@
+import { STRICT_COST_SNAPSHOT_VERSION } from "./strict-cost.js";
 import { randomUUID } from "node:crypto";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -5,7 +6,7 @@ import { FairAgentScheduler, WorkflowAgentExecutor, type AgentDefinition, type A
 import { listRunIds, RunStore, structuralPath as operationPath, type PersistedRun } from "./persistence.js";
 import { budgetUsage, budgetRelaxed, mergeBudget, resumeBudgetAllowed, validateBudget, validateBudgetPatch, WorkflowBudgetRuntime } from "./budget.js";
 import { aliasDrift, createLaunchSnapshot, errorCode, errorText, jsonValue, object } from "./utils.js";
-import { LAUNCH_SNAPSHOT_IDENTITY_VERSION, WorkflowError, isExternallyEndedRunState, type AgentIdentity, type AgentResourcePolicy, type BudgetApprovalRequest, type CheckpointPolicy, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type WorkflowExtensionSettings, type WorkflowMetadata, type WorkflowRetryProvenance, type WorkflowWorktreeReference } from "./types.js";
+import { LAUNCH_SNAPSHOT_IDENTITY_VERSION, LEGACY_CHECKPOINT_IDENTITY_VERSION, WorkflowError, isExternallyEndedRunState, type AgentIdentity, type AgentResourcePolicy, type BudgetApprovalRequest, type CheckpointIdentity, type CheckpointPolicy, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type WorkflowExtensionSettings, type WorkflowMetadata, type WorkflowRetryProvenance, type WorkflowWorktreeReference } from "./types.js";
 import { type WorkflowRegistryApi } from "./registry.js";
 import { RunLifecycle, WorkflowEventPublisher, hostSessionContext, withWorkflowFunctions, withoutActiveShells, workflowRunContext, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
 import { runWorkflow } from "./execution.js";
@@ -33,7 +34,7 @@ export type WorkflowRecoveryDependencies = {
   workflowAgentHandler: (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle, executor: WorkflowAgentExecutor, cwd: string, runId: string, captureRole?: (role: string, model: ModelSpec) => Promise<void>) => (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>;
   shellForRun: (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle, command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>;
   resolveWorktree: (store: RunStore, metadata: WorkflowMetadata, owner: string) => Promise<Readonly<WorkflowWorktreeReference>>;
-  checkpointBridge: (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean, ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, headless?: boolean, checkpointPolicy?: CheckpointPolicy) => (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => Promise<boolean>;
+  checkpointBridge: (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean, ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, headless?: boolean, checkpointPolicy?: CheckpointPolicy) => (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: CheckpointIdentity) => Promise<boolean>;
   phaseBridge: (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle) => (phase: string) => Promise<void>;
   logBridge: (store: RunStore, lifecycle: RunLifecycle, workflowName: string) => (message: string) => Promise<void>;
   lifecycleFor: (store: RunStore, state: RunState, metadata: WorkflowMetadata) => RunLifecycle;
@@ -60,9 +61,15 @@ function workflowRecoveryGuidance(action: "resume" | "retry", state: RunState): 
   if (state === "interrupted") return "Interrupted workflow runs must be resumed from the interactive /workflow picker";
   return `Only failed workflow runs can be retried; source is ${state}`;
 }
+function assertStrictCostRecoveryDisabled(snapshot: Readonly<LaunchSnapshot>): void {
+  if (snapshot.identityVersion === STRICT_COST_SNAPSHOT_VERSION || snapshot.budget?.costUsd?.requireProvenance) {
+    throw new WorkflowError("RESUME_INCOMPATIBLE", "Strict cost workflows cannot be resumed or retried");
+  }
+}
 /** A snapshot can only be re-executed when it carries the current identity scheme and every role its script references. */
 function assertResumableSnapshot(snapshot: Readonly<LaunchSnapshot>, trustedProject: boolean): void {
-  if (snapshot.identityVersion !== LAUNCH_SNAPSHOT_IDENTITY_VERSION) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow launch snapshot identity version is incompatible");
+  assertStrictCostRecoveryDisabled(snapshot);
+  if (snapshot.identityVersion !== LAUNCH_SNAPSHOT_IDENTITY_VERSION && snapshot.identityVersion !== LEGACY_CHECKPOINT_IDENTITY_VERSION) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow launch snapshot identity version is incompatible");
   if (snapshot.roles === undefined) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow role definitions are missing from the launch snapshot");
   if ((snapshot.projectRoles?.length ?? 0) > 0 && !trustedProject) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot restore project roles in an untrusted project");
   const missingRole = snapshot.agentTypes.find((role) => !snapshot.roles?.[role]);
@@ -111,7 +118,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     return { hasUI: host?.hasUI === true, ui };
   };
   type ColdResumeResult = { value: JsonValue; resultPath: string; resultBytes: number; completion: CompletionDeliveryResult };
-  const coldResumeRun = async (run: WorkflowRunRecord, hasUI: boolean, ui: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, trustedProject: boolean, context?: { model: { provider: string; id: string } | undefined; modelRegistry: WorkflowRecoveryContext["modelRegistry"]; deliveryContext: CompletionDeliveryContext; signal?: AbortSignal | undefined; resolvedAliases?: Readonly<Record<string, string>>; blockedAliases?: ReadonlySet<string>; blockedAliasTargets?: Readonly<Record<string, string>> }, modeOverride?: boolean, waitForCompletion = true): Promise<ColdResumeResult | undefined> => {
+  const coldResumeRunUnlocked = async (run: WorkflowRunRecord, hasUI: boolean, ui: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, trustedProject: boolean, context?: { model: { provider: string; id: string } | undefined; modelRegistry: WorkflowRecoveryContext["modelRegistry"]; deliveryContext: CompletionDeliveryContext; signal?: AbortSignal | undefined; resolvedAliases?: Readonly<Record<string, string>>; blockedAliases?: ReadonlySet<string>; blockedAliasTargets?: Readonly<Record<string, string>> }, modeOverride?: boolean, waitForCompletion = true): Promise<ColdResumeResult | undefined> => {
     const loaded = await run.store.load();
     const foreground = modeOverride ?? (loaded.run.delivery?.mode === "foreground" || (loaded.run.delivery?.mode === "background" && loaded.run.delivery.toolCallId !== undefined) || (loaded.run.delivery === undefined && loaded.snapshot.launchMode === "foreground"));
     if (loaded.run.activeShells !== undefined || loaded.run.activeShellStartedAt !== undefined || loaded.run.activeShellsByPhase !== undefined) await persistRunState(run.store, run.metadata, withoutActiveShells);
@@ -124,8 +131,15 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     run.abortController = controller;
     const { settingsPath, currentPolicy, previousAliases, knownModels, availableModels, currentAliases, blockedAliases, blockedAliasTargets, snapshot, script } = await resolveLaunchPrologue({ snapshot: loaded.snapshot, cwd: run.store.cwd, trustedProject, rootModel, ...(context?.modelRegistry ? { modelRegistry: context.modelRegistry } : {}), signal: controller.signal, ...(context?.resolvedAliases ? { resolvedAliases: context.resolvedAliases } : {}), ...(context?.blockedAliases ? { blockedAliases: context.blockedAliases } : {}), ...(context?.blockedAliasTargets ? { blockedAliasTargets: context.blockedAliasTargets } : {}), withPreflight: true });
     if (!script) throw new WorkflowError("INTERNAL_ERROR", "Resume preflight did not produce a launch script");
-    const persistedSnapshot = modeOverride === undefined ? snapshot : createLaunchSnapshot({ ...snapshot, launchMode: foreground ? "foreground" : "background" });
-    await run.store.saveSnapshot(persistedSnapshot);
+    const persistedSnapshot = createLaunchSnapshot({ ...snapshot, identityVersion: LAUNCH_SNAPSHOT_IDENTITY_VERSION, ...(modeOverride === undefined ? {} : { launchMode: foreground ? "foreground" : "background" }) });
+    await run.lifecycle.checkpointMutation(async () => {
+      if (run.lifecycle.state !== "interrupted" && run.lifecycle.state !== "budget_exhausted" || controller.signal.aborted) throw new WorkflowError("CANCELLED", "Workflow recovery is no longer active");
+      // An interrupted legacy wait can still receive a name-based response. Validate its history
+      // before superseding the waits while holding the same lock as response consumption.
+      await run.store.validateCheckpointHistory();
+      await run.store.supersedeCheckpointWaits();
+      await run.store.saveSnapshot(persistedSnapshot);
+    });
     if (modeOverride !== undefined) await persistRunState(run.store, run.metadata, (current) => ({ ...current, delivery: { ...(current.delivery ?? {}), mode: foreground ? "foreground" : "background", state: foreground ? "attached" : "pending" } }));
     scheduler.updateRunLimit(run.store.runId, snapshot.settings.concurrency);
     scheduler.setRunExtensionSettings(run.store.runId, snapshot.settings.extensionSettings);
@@ -181,6 +195,15 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
       throw error;
     }
   };
+  const coldResumeClaims = new Set<WorkflowRunRecord>();
+  const coldResumeRun = async (...args: Parameters<typeof coldResumeRunUnlocked>): Promise<ColdResumeResult | undefined> => {
+    const [run] = args;
+    if (coldResumeClaims.has(run)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow recovery is already in progress");
+    coldResumeClaims.add(run);
+    try { return await coldResumeRunUnlocked(...args); }
+    finally { coldResumeClaims.delete(run); }
+  };
+
   const applyBudgetDecision = async (request: BudgetApprovalRequest, approved: boolean, context?: unknown, signal?: AbortSignal, waitForCompletion = true): Promise<BudgetDecisionResult> => {
     const run = runs.get(request.runId);
     if (!run) throw new WorkflowError("RESUME_INCOMPATIBLE", `Unknown workflow run: ${request.runId}`);
@@ -201,7 +224,9 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
       const { cwd, sessionId } = hostSessionContext(context);
       if (cwd && sessionId) {
         try {
-          const state = (await new RunStore(cwd, sessionId, runId, home).load()).run.state;
+          const loaded = await new RunStore(cwd, sessionId, runId, home).load();
+          assertStrictCostRecoveryDisabled(loaded.snapshot);
+          const state = loaded.run.state;
           assertExpectedWorkflowState(expectedState, state);
           throw new WorkflowError("RESUME_INCOMPATIBLE", workflowRecoveryGuidance("resume", state));
         } catch (error) {
@@ -212,6 +237,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     }
     const loaded = await run.store.load();
     assertExpectedWorkflowState(expectedState, loaded.run.state);
+    assertStrictCostRecoveryDisabled(loaded.snapshot);
     if (loaded.run.state !== "budget_exhausted") throw new WorkflowError("RESUME_INCOMPATIBLE", workflowRecoveryGuidance("resume", loaded.run.state));
     const currentBudget = validateBudget(loaded.run.budget ?? loaded.snapshot.budget);
     const patch = rawPatch === undefined ? {} : validateBudgetPatch(rawPatch);
@@ -277,6 +303,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
       await sourceStore.validateRetrySource();
       await sourceStore.validateBorrowedWorktrees();
       assertResumableSnapshot(loaded.snapshot, trustedProject);
+      await sourceStore.validateCheckpointHistory();
       const modelRegistry = resumeHostContext(context).modelRegistry;
       const hostModel = object(host.model) && typeof host.model.provider === "string" && typeof host.model.id === "string" ? { provider: host.model.provider, id: host.model.id } : { provider: "", id: "" };
       const rootModel: ModelSpec = { provider: hostModel.provider, model: hostModel.id, thinking: pi.getThinkingLevel() };
@@ -292,7 +319,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
       const childBudget = new WorkflowBudgetRuntime(budget, loaded.run.budgetVersion ?? 1, loaded.run.usage, loaded.run.budgetEvents);
       const childInitialBudget = childBudget.snapshot();
       const retry: WorkflowRetryProvenance = { sourceRunId: loaded.run.id, lineageRootRunId, completedPaths, incompletePaths, namedWorktrees };
-      await childStore.create({ id: childRunId, workflowName: loaded.snapshot.metadata.name, cwd, sessionId, state: "interrupted", parentRunId: loaded.run.id, retry, agents: [], agentSessions: [], ...(budget ? { budget } : {}), budgetVersion: loaded.run.budgetVersion ?? 1, ...childInitialBudget }, childBaseSnapshot);
+      await childStore.create({ id: childRunId, workflowName: loaded.snapshot.metadata.name, cwd, sessionId, state: "interrupted", parentRunId: loaded.run.id, retry, agents: [], agentSessions: [], ...(budget ? { budget } : {}), budgetVersion: loaded.run.budgetVersion ?? 1, ...childInitialBudget }, createLaunchSnapshot({ ...childBaseSnapshot, identityVersion: LAUNCH_SNAPSHOT_IDENTITY_VERSION }));
       const model = modelSpec(loaded.snapshot.models[0] ?? "", rootModel);
       const lifecycle = lifecycleFor(childStore, "interrupted", loaded.snapshot.metadata);
       const abortController = new AbortController();

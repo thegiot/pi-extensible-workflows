@@ -135,6 +135,26 @@ void test("reclaims stale valid but undecodable session leases", async () => {
   const lease = await acquisition;
   await lease.release();
 });
+void test("lease acquisition fences the stale-owner rename gap", async () => {
+  const home = mkdtempSync(join(tmpdir(), "piewf-lease-reclaim-fence-"));
+  const cwd = join(home, "project");
+  const directory = runsDirectory(cwd, "session-a", home);
+  const guard = join(directory, ".owner-acquisition");
+  mkdirSync(guard, { recursive: true });
+  try {
+    // Model a process stopped after taking the acquisition fence and moving the stale owner.
+    assert.equal(await hasLiveSessionLease(cwd, "session-a", home), true);
+    const competitors = await Promise.allSettled([acquireSessionLease(cwd, "session-a", home), acquireSessionLease(cwd, "session-a", home)]);
+    assert.deepEqual(competitors.map((result) => result.status === "rejected" && (result.reason as WorkflowError).code), ["RUN_OWNED", "RUN_OWNED"]);
+    rmSync(guard, { recursive: true });
+    writeFileSync(join(directory, "owner.json"), JSON.stringify({ pid: 2147483647, token: "dead", startedAt: 0 }));
+    const acquisitions = await Promise.allSettled(Array.from({ length: 8 }, () => acquireSessionLease(cwd, "session-a", home)));
+    const winners = acquisitions.filter((result) => result.status === "fulfilled");
+    assert.equal(winners.length, 1);
+    await winners[0]?.value.release();
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
 void test("cleans orphaned run creation directories without listing them as runs", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-run-temp-"));
   const cwd = join(home, "project");

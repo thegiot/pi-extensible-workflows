@@ -5,7 +5,8 @@ export {
 export { hasLiveSessionLease, SessionLease, acquireSessionLease, listRunIds, processAlive } from "./session-lease.js";
 export { RunStore } from "./store.js";
 export {
+  decodeJournal, isCheckpointOccurrenceId,
   EffectiveSystemPrompt, PersistedRun, RunSummaryAgent, RunSummaryArtifacts, RunSummary,
-  CompletedOperation, CompletedCheckpointMetadata, CheckpointDecisionProvenance, AwaitingCheckpoint, PendingWorkflowDecision, PersistedOwnershipNode,
+  CompletedOperation, CompletedCheckpointMetadata, CheckpointDecisionProvenance, CheckpointSelector, AwaitingCheckpoint, LiveCheckpoint, PendingWorkflowDecision, PersistedOwnershipNode,
   WorktreeReference, BorrowedWorktreeBinding, isPersistedRun,
 } from "./decoders.js";

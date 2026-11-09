@@ -858,6 +858,8 @@ void test("headless CLI rejects checkpoints by default and with --approve alone"
   assert.match(approveRun.stderr, /Headless CLI checkpoints are unsupported/);
 });
 
+type PersistedCheckpoint = { path: string; value: unknown; checkpoint: { occurrenceId: string; name: string; prompt: string; context: unknown; provenance: string } };
+
 void test("headless CLI resolves checkpoints with explicit --checkpoint-policy", () => {
   const paths = fixture();
   const definition = `cliCheckpoint: { description: "Test checkpoint policy", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: (_input, context) => context.checkpoint({ name: "decision", prompt: "Proceed?", context: { detail: "alpha" } }) }`;
@@ -878,8 +880,12 @@ void test("headless CLI resolves checkpoints with explicit --checkpoint-policy",
   const approveJournalFile = readdirSync(paths.root, { recursive: true }).map(String).find((path) => path.endsWith("/journal.json") && path.includes(approveRunId));
   assert.ok(approveJournalFile, "approve journal file should exist");
   const approveJournal = JSON.parse(readFileSync(join(paths.root, approveJournalFile), "utf8")) as { completed?: Record<string, unknown>; awaiting?: Record<string, unknown> };
-  assert.deepEqual(approveJournal.completed?.["checkpoint/decision"], {
-    path: "checkpoint/decision",
+  const [entry] = Object.values(approveJournal.completed ?? {}) as PersistedCheckpoint[];
+  assert.ok(entry);
+  assert.match(entry.path, /^checkpoint\/v2\//);
+  const { occurrenceId: approveOccurrenceId, ...approveMetadata } = entry.checkpoint;
+  assert.match(approveOccurrenceId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual({ value: entry.value, checkpoint: approveMetadata }, {
     value: true,
     checkpoint: {
       name: "decision",
@@ -888,7 +894,7 @@ void test("headless CLI resolves checkpoints with explicit --checkpoint-policy",
       provenance: "headless_policy",
     },
   });
-  assert.deepEqual(approveJournal.awaiting, {});
+  assert.deepEqual(approveJournal.awaiting, []);
 
   const rejectRun = runIsolatedCli(paths, definition, ["run", "cliCheckpoint", "--checkpoint-policy=reject"]);
   assert.equal(rejectRun.status, 0, rejectRun.stderr);
@@ -906,8 +912,12 @@ void test("headless CLI resolves checkpoints with explicit --checkpoint-policy",
   const rejectJournalFile = readdirSync(paths.root, { recursive: true }).map(String).find((path) => path.endsWith("/journal.json") && path.includes(rejectRunId));
   assert.ok(rejectJournalFile, "reject journal file should exist");
   const rejectJournal = JSON.parse(readFileSync(join(paths.root, rejectJournalFile), "utf8")) as { completed?: Record<string, unknown>; awaiting?: Record<string, unknown> };
-  assert.deepEqual(rejectJournal.completed?.["checkpoint/decision"], {
-    path: "checkpoint/decision",
+  const [rejectedEntry] = Object.values(rejectJournal.completed ?? {}) as PersistedCheckpoint[];
+  assert.ok(rejectedEntry);
+  assert.match(rejectedEntry.path, /^checkpoint\/v2\//);
+  const { occurrenceId: rejectOccurrenceId, ...rejectMetadata } = rejectedEntry.checkpoint;
+  assert.match(rejectOccurrenceId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual({ value: rejectedEntry.value, checkpoint: rejectMetadata }, {
     value: false,
     checkpoint: {
       name: "decision",
@@ -916,7 +926,7 @@ void test("headless CLI resolves checkpoints with explicit --checkpoint-policy",
       provenance: "headless_policy",
     },
   });
-  assert.deepEqual(rejectJournal.awaiting, {});
+  assert.deepEqual(rejectJournal.awaiting, []);
 });
 
 void test("headless CLI checkpoint policy validates invalid values and missing values", () => {
@@ -986,8 +996,12 @@ void test("checkpoint journal records completed operation and clears awaiting", 
   assert.equal(journals.length, 1);
   const journalContent = JSON.parse(readFileSync(join(paths.root, journals[0] ?? ""), "utf8")) as { completed?: Record<string, { value: unknown; path: string }>; awaiting?: Record<string, unknown> };
   const completed = journalContent.completed ?? {};
-  assert.deepEqual(completed["checkpoint/audit"], {
-    path: "checkpoint/audit",
+  const [entry] = Object.values(completed) as PersistedCheckpoint[];
+  assert.ok(entry);
+  assert.match(entry.path, /^checkpoint\/v2\//);
+  const { occurrenceId: auditOccurrenceId, ...auditMetadata } = entry.checkpoint;
+  assert.match(auditOccurrenceId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual({ value: entry.value, checkpoint: auditMetadata }, {
     value: true,
     checkpoint: {
       name: "audit",
@@ -996,7 +1010,7 @@ void test("checkpoint journal records completed operation and clears awaiting", 
       provenance: "headless_policy",
     },
   });
-  assert.deepEqual(journalContent.awaiting, {});
+  assert.deepEqual(journalContent.awaiting, []);
 });
 void test("headless runtime cleanup runs for non-execution CLI paths", async () => {
   const paths = fixture();

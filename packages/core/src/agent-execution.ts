@@ -9,6 +9,7 @@ import { createAgentSession, createCodemodeExtension, createMcpExtension, create
 import type { ExtensionContext, ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 type HerdrModelContext = { readonly model: ExtensionContext["model"]; readonly modelRegistry: ModelRegistry | undefined };
 type AgentMessage = { role: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
+import { strictCostModel, strictCostStream, type StrictCostSessionConfig } from "./strict-cost-openai.js";
 type LocalSessionShutdownReason = "quit" | "resume";
 export interface PiSession {
   readonly sessionId: string;
@@ -120,6 +121,7 @@ export interface AgentExecutionRoot {
   settingsPath?: string;
   extensionSettingsPath?: string;
   runStore?: AgentExecutionRunStore;
+  strictCost?: Omit<StrictCostSessionConfig, "agentId" | "signal">;
   providerPause?: () => Promise<void>;
   agentSetupHooks?: readonly RegisteredAgentSetupHook[];
   agentResourcePolicy?: () => AgentResourcePolicy | Promise<AgentResourcePolicy>;
@@ -138,7 +140,7 @@ function parseModel(value: string | undefined, fallback: ModelSpec, aliases: Rea
 }
 
 function accounting(stats: WorkflowAgentSessionStats): AgentAccounting {
-  return { input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, cost: stats.cost };
+  return { input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, cost: stats.cost, ...(stats.costProvenance ? { costProvenance: stats.costProvenance } : {}) };
 }
 
 const WORKFLOW_HOST_ENTRY_PATHS = ["src/index.ts", "dist/src/index.js", "starter/index.ts", "dist/starter/index.js", "subagents/index.ts", "dist/subagents/index.js"];
@@ -256,7 +258,7 @@ async function preparePiPrompt(native: PiSession, text: string): Promise<PiPromp
   } finally { unsubscribe?.(); }
 }
 
-interface LocalPiSessionHandle { readonly session: PiSession; shutdown(reason: LocalSessionShutdownReason, targetSessionFile?: string): Promise<void> }
+interface LocalPiSessionHandle { readonly session: PiSession; readonly strictStats?: () => WorkflowAgentSessionStats; shutdown(reason: LocalSessionShutdownReason, targetSessionFile?: string): Promise<void> }
 export async function createLocalPiSession(input: SessionInput): Promise<PiSession> { return (await createLocalPiSessionHandle(input)).session; }
 /**
  * Hands the runtime the providers that extensions registered while loading.
@@ -311,23 +313,31 @@ function builtinExtensions(): InlineExtension[] {
 const BUILTIN_EXTENSION_PREFIX = "builtin:";
 function isLlamaModel(model: ModelSpec): boolean { return model.provider === "llama.cpp"; }
 
-async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent?: WorkflowSessionStartEvent): Promise<LocalPiSessionHandle> {
+async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent?: WorkflowSessionStartEvent, strictCost?: StrictCostSessionConfig): Promise<LocalPiSessionHandle> {
   const agentDir = input.agentDir ?? getAgentDir();
   const systemPromptSource = workflowSystemPromptPath(input.cwd, agentDir, input.resourcePolicy?.projectTrusted ?? true);
   const systemPromptOptions = input.systemPrompt !== undefined ? { systemPromptOverride: () => input.systemPrompt } : systemPromptSource !== undefined ? { systemPrompt: systemPromptSource } : {};
   const contextFilesOverride = input.contextFiles === undefined ? undefined : (base: { agentsFiles: Array<{ path: string; content: string }> }) => ({ ...base, agentsFiles: filterContextFiles(base.agentsFiles, input.contextFiles ?? [], input.cwd, agentDir) });
   const manager = input.sessionManager ?? (input.sessionPath ? SessionManager.open(input.sessionPath, join(agentDir, "sessions"), input.cwd) : input.agentDir ? SessionManager.create(input.cwd, join(agentDir, "sessions")) : SessionManager.create(input.cwd));
   if (!input.sessionPath) manager.appendSessionInfo(input.sessionLabel);
-  const modelRuntime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json") });
+  const modelRuntime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: strictCost ? null : join(agentDir, "models.json") });
   const customTools = [...(input.customTools ?? []), ...(input.resultTool ? [input.resultTool] : [])];
   const tools = [...new Set([...input.tools, ...customTools.map(({ name }) => name)])];
   let settingsManager: SettingsManager;
   let resourceLoader: DefaultResourceLoader;
-  const builtins = builtinExtensions();
+  const builtins = strictCost ? [] : builtinExtensions();
   const builtinNames = builtins.flatMap((extension) => typeof extension === "function" ? [] : [extension.name]);
   const extensionFactories = [...builtins, ...(input.extensionFactories ?? [])];
   const policy = input.resourcePolicy;
-  if (policy) {
+  if (strictCost) {
+    settingsManager = SettingsManager.inMemory({ cacheWarming: "off", compaction: { enabled: false }, retry: { enabled: false } });
+    resourceLoader = new DefaultResourceLoader({
+      cwd: input.cwd, agentDir, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true, noContextFiles: true,
+      ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}),
+      ...systemPromptOptions,
+    });
+    await resourceLoader.reload();
+  } else if (policy) {
     settingsManager = SettingsManager.create(input.cwd, agentDir, { projectTrusted: false });
     settingsManager.setProjectTrusted(policy.projectTrusted);
     const packageManager = new DefaultPackageManager({ cwd: input.cwd, agentDir, settingsManager, builtinExtensions: builtinNames });
@@ -380,7 +390,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
   }
   const providerFailures = flushExtensionProviders(resourceLoader, modelRuntime);
   await modelRuntime.refresh({ allowNetwork: false });
-  const model = modelRuntime.getModel(input.model.provider, input.model.model);
+  const model = strictCost ? strictCostModel : modelRuntime.getModel(input.model.provider, input.model.model);
   if (!model) {
     // A provider that failed to register is the likeliest reason its models are
     // missing, so the failure travels with the complaint rather than being
@@ -390,7 +400,12 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}${because}`);
   }
   const effectiveSessionStartEvent = input.settings === undefined && sessionStartEvent === undefined ? undefined : { ...(sessionStartEvent ?? { type: "session_start" as const, reason: "startup" as const }), settings: input.settings ?? Object.freeze({}) };
-  const { session } = await createAgentSession({ ...(input.options ?? {}), cwd: input.cwd, agentDir, modelRuntime, model, settingsManager, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), resourceLoader, ...(effectiveSessionStartEvent ? { sessionStartEvent: effectiveSessionStartEvent } : {}), sessionManager: manager });
+  const { session } = await createAgentSession({ ...(input.options ?? {}), cwd: input.cwd, agentDir, modelRuntime, model, settingsManager, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(!strictCost && input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), resourceLoader, ...(effectiveSessionStartEvent ? { sessionStartEvent: effectiveSessionStartEvent } : {}), sessionManager: manager });
+  const strict = strictCost && strictCostStream(strictCost);
+  if (strict) {
+    session.agent.getApiKey = () => strictCost.options.apiKey;
+    session.agent.streamFunction = strict.stream;
+  }
   const nativeDispose = session.dispose.bind(session);
   let disposal: Promise<void> | undefined;
   const shutdown = (reason: LocalSessionShutdownReason, targetSessionFile?: string): Promise<void> => {
@@ -428,7 +443,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     herdrResourcePaths: resourcePaths,
     herdrContextFiles: resourceLoader.getAgentsFiles().agentsFiles,
   }) as unknown as PiSession;
-  return { session: managedSession, shutdown };
+  return { session: managedSession, shutdown, ...(strict ? { strictStats: strict.stats } : {}) };
 }
 function workflowAgentMessage(message: AgentMessage | undefined): WorkflowAgentMessage | undefined { return normalizePiMessage(message); }
 function latestUsableAssistant(messages: readonly AgentMessage[]): WorkflowAgentMessage | undefined { for (let index = messages.length - 1; index >= 0; index -= 1) { const candidate = workflowAgentMessage(messages[index]); if (candidate?.role === "assistant" && !isEmptyAbortedAssistant(candidate)) return candidate; } return undefined; }
@@ -451,7 +466,7 @@ export async function createLocalWorkflowAgentSession(prepared: Readonly<Prepare
     ...(prepared.systemPromptAppend ? { systemPromptAppend: prepared.systemPromptAppend } : {}), extensionFactories: [...(prepared.extensionFactories ?? []), ...(prepared.extensionFactories?.includes(localToolTimingExtension) ? [] : [localToolTimingExtension])],
     ...(prepared.additionalSkillPaths?.length ? { additionalSkillPaths: [...prepared.additionalSkillPaths] } : {}), ...(prepared.contextFiles === undefined ? {} : { contextFiles: [...prepared.contextFiles] }), ...(prepared.resourcePolicy ? { resourcePolicy: structuredClone(prepared.resourcePolicy) } : {}), settings: context.settings, ...(prepared.options ? { options: { ...prepared.options } } : {}),
   };
-  let nativeHandle = await createLocalPiSessionHandle(input);
+  let nativeHandle = await createLocalPiSessionHandle(input, undefined, context.strictCost);
   let native = nativeHandle.session;
   let nativeShutdownReason: LocalSessionShutdownReason | undefined;
   let disposal: Promise<void> | undefined;
@@ -541,6 +556,7 @@ export async function createLocalWorkflowAgentSession(prepared: Readonly<Prepare
     return aborting ??= Promise.resolve().then(() => native.abort?.()).then(() => undefined).finally(() => { aborting = undefined; });
   };
   const suspend = async (): Promise<void> => {
+    if (context.strictCost) throw new WorkflowError("RESUME_INCOMPATIBLE", "Strict cost sessions cannot transfer to another runtime");
     if (state === "disposing" || state === "disposed") throw new WorkflowError("INTERNAL_ERROR", "Local workflow session is closing");
     if (state === "suspended" || !native.sessionFile) return;
     if (state === "suspending") { await suspendOperation; return; }
@@ -563,6 +579,7 @@ export async function createLocalWorkflowAgentSession(prepared: Readonly<Prepare
   const isActive = () => state === "active";
   const isClosing = () => state === "disposing" || state === "disposed";
   const resume = async (): Promise<void> => {
+    if (context.strictCost) throw new WorkflowError("RESUME_INCOMPATIBLE", "Strict cost sessions cannot be reopened");
     if (state === "suspending") { await suspendOperation; return resume(); }
     if (state === "resuming") { if (resumeOperation) await resumeOperation; return; }
     if (state === "disposing" || state === "disposed" || !native.sessionFile) return;
@@ -627,7 +644,7 @@ export async function createLocalWorkflowAgentSession(prepared: Readonly<Prepare
     getHerdrModelContext: () => native.herdrModelContext,
     getState: () => Object.freeze(workflowAgentState(native, prepared)),
     getResourceInspection: () => native.getResourceInspection(),
-    getSessionStats: () => workflowAgentStats(native.getSessionStats()),
+    getSessionStats: () => nativeHandle.strictStats?.() ?? workflowAgentStats(native.getSessionStats()),
     getLastAssistant: () => latestUsableAssistant(native.messages),
     subscribe(listener: (event: WorkflowAgentSessionEvent) => void) { listeners.add(listener); listener({ type: "state_changed", state: workflowAgentState(native, prepared) }); return () => listeners.delete(listener); },
     subscribeAsync(listener: (event: WorkflowAgentSessionEvent) => void | Promise<void>) {
@@ -982,6 +999,12 @@ export class WorkflowAgentExecutor {
     if (!Number.isInteger(options.retries ?? 0) || (options.retries ?? 0) < 0) throw new WorkflowError("INVALID_METADATA", "retries must be a non-negative integer");
     if (options.timeoutMs !== undefined && options.timeoutMs !== null && (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0)) throw new WorkflowError("INVALID_METADATA", "timeoutMs must be null or a positive integer");
     let resolved = this.resolve(options);
+    const strictCost = this.root.strictCost;
+    if (strictCost && (this.transport !== localAgentTransport || options.parent || options.sessionPath || options.retries ||
+      resolved.model.provider !== strictCostModel.provider || resolved.model.model !== strictCostModel.id ||
+      resolved.tools.length || customTools.length || options.extensions?.length || options.skills?.length)) {
+      throw new WorkflowError("COST_PROVENANCE_UNAVAILABLE", "Strict estimated cost requires the approved local model, no external agent tools or extensions, and no replay or retry");
+    }
     let recoveryModel: ModelSpec | undefined;
     let cwd: string;
     if (options.parent) {
@@ -1046,7 +1069,7 @@ export class WorkflowAgentExecutor {
         const cacheRead = usage.cacheRead;
         const cacheWrite = usage.cacheWrite;
         const cost = usage.costUsd;
-        if (usage.availability === "complete" && typeof input === "number" && Number.isFinite(input) && typeof output === "number" && Number.isFinite(output) && typeof cacheRead === "number" && Number.isFinite(cacheRead) && typeof cacheWrite === "number" && Number.isFinite(cacheWrite) && typeof cost === "number" && Number.isFinite(cost)) return { input, output, cacheRead, cacheWrite, cost };
+        if (usage.availability === "complete" && typeof input === "number" && Number.isFinite(input) && typeof output === "number" && Number.isFinite(output) && typeof cacheRead === "number" && Number.isFinite(cacheRead) && typeof cacheWrite === "number" && Number.isFinite(cacheWrite) && typeof cost === "number" && Number.isFinite(cost)) return { input, output, cacheRead, cacheWrite, cost, ...(usage.costProvenance ? { costProvenance: usage.costProvenance } : {}) };
         return accounting(active.getSessionStats());
       };
       const progressHandler = options.onProgress;
@@ -1071,7 +1094,7 @@ export class WorkflowAgentExecutor {
         await options.onAttempt?.({ attempt, transport: attemptSetup.transport.id, accounting: zeroAccounting(), setup: setupSummary });
 
         const transportBase = fallbackSetupContext(this.root, options, attemptSignal);
-        const transportContext = Object.freeze({ run: transportBase.run, identity: transportBase.identity, attempt, signal: attemptSignal, settings: setup.prepared.settings ?? Object.freeze({}), ...(transportBase.tuiIndex === undefined ? {} : { tuiIndex: transportBase.tuiIndex }), ...(transportBase.tuiLabel === undefined ? {} : { tuiLabel: transportBase.tuiLabel }) });
+        const transportContext = Object.freeze({ run: transportBase.run, identity: transportBase.identity, attempt, signal: attemptSignal, ...(strictCost ? { strictCost: { ...strictCost, agentId: options.agentNodeId ?? options.label, signal: attemptSignal } } : {}), settings: setup.prepared.settings ?? Object.freeze({}), ...(transportBase.tuiIndex === undefined ? {} : { tuiIndex: transportBase.tuiIndex }), ...(transportBase.tuiLabel === undefined ? {} : { tuiLabel: transportBase.tuiLabel }) });
         handoff = createLiveSessionHandoff();
         handoffAbort = () => { releaseHandoff("attempt cancelled"); };
         attemptSignal.addEventListener("abort", handoffAbort, { once: true });

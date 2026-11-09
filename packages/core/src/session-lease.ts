@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { link, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { link, mkdir, open, readFile, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { WorkflowError } from "./types.js";
@@ -9,6 +9,7 @@ import { json } from "./io.js";
 import { runsDirectory } from "./paths.js";
 
 const SESSION_OWNER_FILE = "owner.json";
+const SESSION_ACQUISITION_DIRECTORY = ".owner-acquisition";
 const SESSION_OWNER_WRITE_GRACE_MS = 30_000;
 const RUN_CREATE_TEMP = /^\.([a-zA-Z0-9._-]+)\.(\d+)\.[0-9a-f-]+\.tmp$/;
 
@@ -21,7 +22,10 @@ export async function processAlive(pid: number, startedAt?: number): Promise<boo
   return true;
 }
 export async function hasLiveSessionLease(cwd: string, sessionId: string, home = homedir()): Promise<boolean> {
-  const path = join(runsDirectory(cwd, sessionId, home), SESSION_OWNER_FILE);
+  const directory = runsDirectory(cwd, sessionId, home);
+  try { await stat(join(directory, SESSION_ACQUISITION_DIRECTORY)); return true; }
+  catch (error) { if (!isNodeError(error, "ENOENT")) throw error; }
+  const path = join(directory, SESSION_OWNER_FILE);
   let owner: unknown;
   try { owner = await json(path); }
   catch (error) { if (isNodeError(error, "ENOENT")) return false; throw error; }
@@ -70,7 +74,20 @@ export class SessionLease {
 export async function acquireSessionLease(cwd: string, sessionId: string, home = homedir()): Promise<SessionLease> {
   const directory = runsDirectory(cwd, sessionId, home);
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  const path = join(directory, SESSION_OWNER_FILE);
+  const guard = join(directory, SESSION_ACQUISITION_DIRECTORY);
+  try { await mkdir(guard, { mode: 0o700 }); }
+  catch (error) {
+    if (!isNodeError(error, "EEXIST")) throw error;
+    throw new WorkflowError("RUN_OWNED", `Pi session ${sessionId} is acquiring its ownership lease. If acquisition was interrupted, verify no owner or acquisition process is active before removing ${guard}`);
+  }
+  try {
+    return await acquireUnderGuard(join(directory, SESSION_OWNER_FILE), sessionId);
+  } finally {
+    await rmdir(guard);
+  }
+}
+
+async function acquireUnderGuard(path: string, sessionId: string): Promise<SessionLease> {
   for (;;) {
     const token = randomUUID();
     const owner: SessionOwner = { pid: process.pid, token, startedAt: process.platform === "linux" ? (await stat(`/proc/${String(process.pid)}`)).ctimeMs : Date.now() };

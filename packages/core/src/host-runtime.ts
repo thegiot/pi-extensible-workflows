@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { type AgentProviderFailure, type AgentProviderRecovery, WorkflowAgentExecutor } from "./agent-execution.js";
 import { type WorkflowBudgetRuntime } from "./budget.js";
 import { type PersistedRun, type RunStore, type WorktreeReference } from "./persistence.js";
-import { deepFreeze, errorCode, errorText, fail, isWorkflowErrorCode, jsonValue, object } from "./utils.js";
+import { SerialLane, deepFreeze, errorCode, errorText, fail, isWorkflowErrorCode, jsonValue, object } from "./utils.js";
 import { validateAgentOptions, validateShellOptions, workflowPrompt } from "./validation.js";
 import { type WorkflowRegistryApi } from "./registry.js";
 import { HARD_TERMINAL_RUN_STATES, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentOptions, type AgentRecord, type BudgetEvent, type FunctionIdentity, type JsonValue, type ModelSpec, type ParallelResult, type ParallelTasks, type PipelineItems, type PipelineResult, type PipelineStages, type RunState, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowExecution, type WorkflowExtensionSettings, type WorkflowFunctionContext, type WorkflowMetadata, type WorkflowRunContext, type WorkflowWorktreeCallback, type WorkflowWorktreeReference } from "./types.js";
@@ -25,8 +25,9 @@ export type WorkflowRunRecord = {
   providerErrorRecovery?: (failure: AgentProviderFailure) => Promise<AgentProviderRecovery>;
   execution?: WorkflowExecution;
   completion?: Promise<unknown>;
+  strictTerminalState?: "stopped" | "interrupted";
   foreground?: boolean;
-  checkpointResolvers: Map<string, (value: boolean) => void>;
+  checkpointResolvers: Map<string, { resolve: (value: boolean) => void; reject: (reason: unknown) => void; signal: AbortSignal; policy: boolean; notified?: boolean }>;
   update?: (result: WorkflowToolUpdate) => void;
 };
 
@@ -51,6 +52,7 @@ export function hostSessionContext(context: unknown): { cwd?: string; sessionId?
 export class RunLifecycle {
   #state: RunState;
   #active = 0;
+  readonly #checkpointLane = new SerialLane();
   #waiters: Array<() => void> = [];
 
   constructor(state: RunState = "running", private readonly changed?: (state: RunState, previousState: RunState, reason?: string) => void | Promise<void>) { this.#state = state; }
@@ -99,9 +101,16 @@ export class RunLifecycle {
     await this.enter();
   }
 
+  /** Orders checkpoint claims and commits with the run's terminal transition. */
+  checkpointMutation<T>(task: () => Promise<T>): Promise<T> { return this.#checkpointLane.run(task); }
+
   async terminal(state: "completed" | "failed" | "stopped" | "interrupted" | "budget_exhausted", reason?: string): Promise<void> {
-    if (HARD_TERMINAL_RUN_STATES.has(this.#state)) throw new WorkflowError("RESUME_INCOMPATIBLE", `${this.#state} runs are terminal`);
-    await this.#set(state, reason ?? state);
+    const { persisted } = await this.checkpointMutation(async () => {
+      if (HARD_TERMINAL_RUN_STATES.has(this.#state)) throw new WorkflowError("RESUME_INCOMPATIBLE", `${this.#state} runs are terminal`);
+      // Only the state change is serialized. Persistence and event delivery can reenter the host.
+      return { persisted: this.#set(state, reason ?? state) };
+    });
+    await persisted;
     for (const resolve of this.#waiters.splice(0)) resolve();
   }
 
@@ -165,7 +174,7 @@ export class WorkflowEventPublisher {
     if (previousPhase !== phase) await this.#publish(store, metadata, WORKFLOW_PHASE_CHANGED_EVENT, { ...(previousPhase !== undefined ? { previousPhase } : {}), phase });
   }
 
-  async checkpoint(store: RunStore, metadata: WorkflowMetadata, name: string, state: WorkflowCheckpointState): Promise<void> { await this.#publish(store, metadata, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { name, state }); }
+  async checkpoint(store: RunStore, metadata: WorkflowMetadata, name: string, state: WorkflowCheckpointState, occurrenceId?: string): Promise<void> { await this.#publish(store, metadata, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { name, state, ...(occurrenceId === undefined ? {} : { occurrenceId }) }); }
 
   async budget(store: RunStore, metadata: WorkflowMetadata, run: Pick<PersistedRun, "budgetEvents">): Promise<void> {
     const seen = this.#budgetEvents.get(store.runId) ?? new Set<string>();
@@ -355,7 +364,9 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
       withWorktree: <Result extends JsonValue>(name: string, callback: WorkflowWorktreeCallback<Result>) => hostWithWorktree(name, callback, bridge.worktree, signal),
       checkpoint: async (...args: readonly unknown[]) => {
         if (!bridge.checkpoint || !object(args[0]) || !jsonValue(args[0])) fail("INTERNAL_ERROR", "No checkpoint bridge is available");
-        return bridge.checkpoint(args[0], signal);
+        const inherited = inheritedHostAgentPath.getStore() ?? structuralPath;
+        const owner = inheritedHostWorktreeOwner.getStore() ?? worktreeOwner;
+        return bridge.checkpoint(args[0], signal, { structuralPath: [...inherited], callSite: `function:${path}`, replaySafe: false, ...(owner ? { worktreeOwner: owner } : {}) });
       },
       phase: (name: string) => { ownSideEffect(() => bridge.phase?.(name)); },
       log: (message: string) => { ownSideEffect(() => bridge.log?.(message)); },

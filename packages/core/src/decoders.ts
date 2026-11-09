@@ -1,3 +1,4 @@
+import { decodeCostProvenance } from "./strict-cost.js";
 import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type AgentDefinition, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowExtensionSettings, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
 import type { OwnershipRecord, ScheduledAgentOptions } from "./agent-execution.js";
 import { finiteNumber, isThinkingLevel, isWorkflowErrorCode, jsonValue, object, positiveInteger, validWorkflowExtensionNamespace } from "./utils.js";
@@ -8,12 +9,14 @@ export interface RunSummaryAgent { id: string; name: string; label?: string; sta
 export interface RunSummaryArtifacts { runDirectory: string; statePath: string; journalPath: string; snapshotPath: string; workflowPath: string; resultPath: string; summaryPath: string }
 export interface RunSummary { schemaVersion: 1; runId: string; sessionId: string; workflowName: string; state: RunRecord["state"]; createdAt: string; updatedAt: string; terminalAt?: string; usage: WorkflowBudgetUsage; agents: readonly RunSummaryAgent[]; error?: RunRecord["error"]; failedAt?: string; replayablePaths: readonly string[]; incompletePaths: readonly string[]; artifacts: RunSummaryArtifacts }
 export type CheckpointDecisionProvenance = "headless_policy" | "interactive";
-export interface CompletedCheckpointMetadata { name: string; prompt: string; context: JsonValue; provenance?: CheckpointDecisionProvenance }
+export interface CompletedCheckpointMetadata { name: string; prompt: string; context: JsonValue; provenance?: CheckpointDecisionProvenance; occurrenceId?: string }
 export interface CompletedOperation { path: string; value: JsonValue; checkpoint?: CompletedCheckpointMetadata }
-export interface AwaitingCheckpoint { path: string; name: string; prompt: string; context: JsonValue }
+export interface AwaitingCheckpoint { path: string; name: string; prompt: string; context: JsonValue; occurrenceId?: string }
+export type CheckpointSelector = string | { occurrenceId: string };
+export type LiveCheckpoint = AwaitingCheckpoint & { occurrenceId: string };
 export type PendingWorkflowDecision = BudgetApprovalRequest
 export type PersistedOwnershipNode = OwnershipRecord
-export type Journal = { completed: Record<string, CompletedOperation>; awaiting?: Record<string, AwaitingCheckpoint>; decisions?: Record<string, PendingWorkflowDecision> };
+export type Journal = { completed: Record<string, CompletedOperation>; awaiting?: Record<string, AwaitingCheckpoint>; decisions?: Record<string, PendingWorkflowDecision>; checkpointVersion?: 1; supersededCheckpointNames?: string[]; checkpointReplayBlocked?: true };
 type PersistedAgentSession = RunRecord["agentSessions"][number];
 type PersistedAgent = RunRecord["agents"][number];
 type PersistedPhaseRecord = NonNullable<RunRecord["phaseHistory"]>[number];
@@ -138,7 +141,11 @@ function decodeBudget(value: unknown): NonNullable<RunRecord["budget"]> | undefi
     if (raw === undefined) continue;
     const limits = decodeBudgetLimits(raw);
     if (limits === undefined) return undefined;
-    budget[dimension] = limits;
+    if (object(raw) && "requireProvenance" in raw) {
+      if (dimension !== "costUsd" || raw.requireProvenance !== true || limits.hard === undefined || limits.hard < 0 ||
+        limits.soft !== undefined && (limits.soft < 0 || limits.soft >= limits.hard)) return undefined;
+      budget.costUsd = { ...limits, hard: limits.hard, requireProvenance: true };
+    } else budget[dimension] = limits;
   }
   return budget;
 }
@@ -236,7 +243,9 @@ function decodeAgentSession(value: unknown): PersistedAgentSession | undefined {
 }
 function decodeAgentAccounting(value: unknown): AgentAccounting | undefined {
   if (!object(value) || !finiteNumber(value.input) || !finiteNumber(value.output) || !finiteNumber(value.cacheRead) || !finiteNumber(value.cacheWrite) || !finiteNumber(value.cost)) return undefined;
-  return { input: value.input, output: value.output, cacheRead: value.cacheRead, cacheWrite: value.cacheWrite, cost: value.cost };
+  const costProvenance = decodeCostProvenance(value.costProvenance);
+  if (value.costProvenance !== undefined && !costProvenance) return undefined;
+  return { input: value.input, output: value.output, cacheRead: value.cacheRead, cacheWrite: value.cacheWrite, cost: value.cost, ...(costProvenance ? { costProvenance } : {}) };
 }
 function decodeAgentActivity(value: unknown): AgentActivity | undefined {
   if (!object(value) || typeof value.text !== "string") return undefined;
@@ -363,7 +372,9 @@ function decodeWorkflowError(value: unknown): NonNullable<RunRecord["error"]> | 
 }
 function decodeUsage(value: unknown): WorkflowBudgetUsage | undefined {
   if (!object(value) || !finiteNumber(value.tokens) || !finiteNumber(value.costUsd) || !finiteNumber(value.durationMs) || !finiteNumber(value.agentLaunches)) return undefined;
-  return { tokens: value.tokens, costUsd: value.costUsd, durationMs: value.durationMs, agentLaunches: value.agentLaunches };
+  const costProvenance = decodeCostProvenance(value.costProvenance);
+  if (value.costProvenance !== undefined && !costProvenance) return undefined;
+  return { tokens: value.tokens, costUsd: value.costUsd, ...(costProvenance ? { costProvenance } : {}), durationMs: value.durationMs, agentLaunches: value.agentLaunches };
 }
 function decodeBudgetEvent(value: unknown): BudgetEvent | undefined {
   if (!object(value) || !isBudgetEventType(value.type) || !integer(value.budgetVersion) || !finiteNumber(value.at)) return undefined;
@@ -516,17 +527,23 @@ function decodeCheckpointProvenance(value: unknown): CheckpointDecisionProvenanc
   if (value === "headless_policy" || value === "interactive") return value;
   return INVALID_PERSISTED_VALUE;
 }
+export function isCheckpointOccurrenceId(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value);
+}
+
 function decodeCompletedCheckpointMetadata(value: unknown): CompletedCheckpointMetadata | undefined {
   if (!object(value) || typeof value.name !== "string" || typeof value.prompt !== "string") return undefined;
   const context = decodeJsonValue(value.context);
   if (context === undefined) return undefined;
   const provenance = decodeCheckpointProvenance(value.provenance);
-  if (provenance === INVALID_PERSISTED_VALUE) return undefined;
+  const occurrenceId = value.occurrenceId;
+  if (provenance === INVALID_PERSISTED_VALUE || occurrenceId !== undefined && !isCheckpointOccurrenceId(occurrenceId)) return undefined;
   return {
     name: value.name,
     prompt: value.prompt,
     context,
     ...(provenance !== undefined ? { provenance } : {}),
+    ...(occurrenceId === undefined ? {} : { occurrenceId }),
   };
 }
 function decodeCompletedOperation(value: unknown): CompletedOperation | undefined {
@@ -544,8 +561,9 @@ function decodeCompletedOperation(value: unknown): CompletedOperation | undefine
 function decodeAwaitingCheckpoint(value: unknown): AwaitingCheckpoint | undefined {
   if (!object(value) || typeof value.path !== "string" || typeof value.name !== "string" || typeof value.prompt !== "string") return undefined;
   const context = decodeJsonValue(value.context);
-  if (context === undefined) return undefined;
-  return { path: value.path, name: value.name, prompt: value.prompt, context };
+  const occurrenceId = value.occurrenceId;
+  if (context === undefined || occurrenceId !== undefined && !isCheckpointOccurrenceId(occurrenceId)) return undefined;
+  return { path: value.path, name: value.name, prompt: value.prompt, context, ...(occurrenceId === undefined ? {} : { occurrenceId }) };
 }
 function decodePendingWorkflowDecision(value: unknown): PendingWorkflowDecision | undefined {
   if (!object(value) || value.kind !== "budget" || typeof value.proposalId !== "string" || typeof value.runId !== "string" || !integer(value.budgetVersion)) return undefined;
@@ -558,11 +576,39 @@ function decodePendingWorkflowDecision(value: unknown): PendingWorkflowDecision 
 }
 export function decodeJournal(value: unknown): Journal | undefined {
   if (!object(value)) return undefined;
+  const checkpointVersion = value.checkpointVersion;
+  if (checkpointVersion !== undefined && checkpointVersion !== 1) return undefined;
   const completed = decodeRecord(value.completed, decodeCompletedOperation);
-  const awaiting = value.awaiting === undefined ? undefined : decodeRecord(value.awaiting, decodeAwaitingCheckpoint);
+  const pending = checkpointVersion === 1 ? decodeArray(value.awaiting, decodeAwaitingCheckpoint) : undefined;
+  const awaiting = pending ? Object.fromEntries(pending.map((checkpoint) => [checkpoint.path, checkpoint]))
+    : value.awaiting === undefined ? undefined : decodeRecord(value.awaiting, decodeAwaitingCheckpoint);
   const decisions = value.decisions === undefined ? undefined : decodeRecord(value.decisions, decodePendingWorkflowDecision);
-  if (!completed || value.awaiting !== undefined && !awaiting || value.decisions !== undefined && !decisions) return undefined;
-  return { completed, ...(awaiting === undefined ? {} : { awaiting }), ...(decisions === undefined ? {} : { decisions }) };
+  const superseded = value.supersededCheckpointNames === undefined ? undefined : decodeStringArray(value.supersededCheckpointNames);
+  if (!completed || value.awaiting !== undefined && !awaiting || value.decisions !== undefined && !decisions
+      || checkpointVersion === 1 && (!pending || Object.keys(awaiting ?? {}).length !== pending.length)
+      || value.supersededCheckpointNames !== undefined && !superseded || value.checkpointReplayBlocked !== undefined && value.checkpointReplayBlocked !== true) return undefined;
+  const occurrenceIds = new Set<string>();
+  for (const [key, operation] of Object.entries(completed)) {
+    if (operation.path !== key) return undefined;
+    const id = operation.checkpoint?.occurrenceId;
+    if (key.startsWith("checkpoint/v2/") && id === undefined) return undefined;
+    if (id !== undefined) {
+      if (checkpointVersion !== 1 || typeof operation.value !== "boolean" || occurrenceIds.has(id)) return undefined;
+      occurrenceIds.add(id);
+    }
+  }
+  for (const [key, checkpoint] of Object.entries(awaiting ?? {})) {
+    if (checkpoint.path !== key || Object.hasOwn(completed, key)) return undefined;
+    const id = checkpoint.occurrenceId;
+    if (key.startsWith("checkpoint/v2/") && id === undefined) return undefined;
+    if (id !== undefined) {
+      if (checkpointVersion !== 1 || occurrenceIds.has(id)) return undefined;
+      occurrenceIds.add(id);
+    }
+  }
+  return { completed, ...(awaiting === undefined ? {} : { awaiting }), ...(decisions === undefined ? {} : { decisions }),
+    ...(checkpointVersion === undefined ? {} : { checkpointVersion }), ...(superseded === undefined ? {} : { supersededCheckpointNames: superseded }),
+    ...(value.checkpointReplayBlocked === true ? { checkpointReplayBlocked: true } : {}) };
 }
 export function decodeBooleanCheckpointResult(value: unknown): boolean | undefined { return typeof value === "boolean" ? value : undefined; }
 export function decodeSummaryProjection(value: unknown): Partial<RunSummary> | undefined {

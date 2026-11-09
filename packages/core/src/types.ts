@@ -29,7 +29,7 @@ export const WORKFLOW_BLOCKED_EVENT = "workflow:blocked";
 export const ERROR_CODES = [
   "CONFIG_ERROR", "INVALID_SETTINGS", "INVALID_SYNTAX", "INVALID_METADATA", "DUPLICATE_NAME", "INVALID_SCHEMA", "UNKNOWN_MODEL", "UNKNOWN_TOOL", "UNKNOWN_AGENT_TYPE",
   "RUN_OWNED", "RUN_NOT_FOUND", "REGISTRY_FROZEN", "GLOBAL_COLLISION", "MISSING_WORKFLOW", "RPC_LIMIT_EXCEEDED", "SHELL_FAILED", "AGENT_TIMEOUT", "AGENT_FAILED", "AGENT_RESULT_COLLECTED", "RESULT_INVALID",
-  "CANCELLED", "WORKER_UNRESPONSIVE", "WORKTREE_FAILED", "RESUME_INCOMPATIBLE", "BUDGET_EXHAUSTED", "INTERNAL_ERROR",
+  "CANCELLED", "WORKER_UNRESPONSIVE", "WORKTREE_FAILED", "RESUME_INCOMPATIBLE", "BUDGET_EXHAUSTED", "COST_PROVENANCE_UNAVAILABLE", "INTERNAL_ERROR",
   ] as const;
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -66,9 +66,14 @@ export interface ShellResult { exitCode: number | null; stdout: string; stderr: 
 export const BUDGET_DIMENSIONS = ["tokens", "costUsd", "durationMs", "agentLaunches"] as const;
 export type BudgetDimension = (typeof BUDGET_DIMENSIONS)[number];
 export interface BudgetLimits { soft?: number; hard?: number }
-export type WorkflowBudget = Partial<Record<BudgetDimension, BudgetLimits>>;
+export type WorkflowBudget = Partial<Record<Exclude<BudgetDimension, "costUsd">, BudgetLimits>> & {
+  costUsd?: BudgetLimits & ({ requireProvenance?: never } | { requireProvenance: true; hard: number });
+};
 export type WorkflowBudgetPatch = Partial<Record<BudgetDimension, BudgetLimits | { soft?: number | null; hard?: number | null } | null>>;
-export interface WorkflowBudgetUsage { tokens: number; costUsd: number; durationMs: number; agentLaunches: number }
+export type CostProvenance =
+  | { status: "estimated" | "pending"; usd: number }
+  | { status: "unknown"; reason: string };
+export interface WorkflowBudgetUsage { tokens: number; costUsd: number; costProvenance?: CostProvenance; durationMs: number; agentLaunches: number }
 export const BUDGET_EVENT_TYPES = ["soft_crossed", "hard_overrun", "hard_exhausted", "adjustment_requested", "adjustment_approved", "adjustment_rejected"] as const;
 export type BudgetEventType = (typeof BUDGET_EVENT_TYPES)[number];
 export interface BudgetEvent { type: BudgetEventType; budgetVersion: number; dimensions: readonly BudgetDimension[]; usage: WorkflowBudgetUsage; limits: WorkflowBudget; at: number; proposalId?: string; previous?: WorkflowBudget; proposed?: WorkflowBudget }
@@ -83,7 +88,7 @@ export interface WorkflowRunFailedEvent extends WorkflowEventBase { error: Workf
 export interface WorkflowAgentStateChangedEvent extends WorkflowEventBase { agentId: string; displayLabel: string; role?: string; structuralPath: readonly string[]; parentId?: string; parentBreadcrumb?: string; worktreeOwner?: string; previousState?: AgentState; state: AgentState; attempt: number }
 export interface WorkflowPhaseChangedEvent extends WorkflowEventBase { previousPhase?: string; phase: string }
 export type WorkflowCheckpointState = "awaiting" | "approved" | "rejected";
-export interface WorkflowCheckpointStateChangedEvent extends WorkflowEventBase { name: string; state: WorkflowCheckpointState }
+export interface WorkflowCheckpointStateChangedEvent extends WorkflowEventBase { name: string; state: WorkflowCheckpointState; occurrenceId?: string }
 export interface WorkflowBudgetEvent extends WorkflowEventBase { type: BudgetEventType; budgetVersion: number; dimensions: readonly BudgetDimension[]; usage: WorkflowBudgetUsage; limits: WorkflowBudget; proposalId?: string; previous?: WorkflowBudget; proposed?: WorkflowBudget }
 export interface ModelSpec { provider: string; model: string; thinking?: ThinkingLevel }
 export interface WorkflowModelAliasResolverContext { cwd: string; projectTrusted: boolean; rootModel: ModelSpec; knownModels: ReadonlySet<string>; availableModels: ReadonlySet<string>; signal: AbortSignal }
@@ -128,13 +133,25 @@ export interface AgentResourceInspection { selectors: AgentResourceSelectorSet; 
 export interface ContextFile { readonly path: string; readonly content: string }
 export interface AgentActivity { kind: "reasoning" | "tool" | "text"; text: string }
 export const WORKFLOW_AGENT_STALL_THRESHOLD_MS = 10 * 60 * 1000;
-export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
+export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; costProvenance?: CostProvenance }
 export function zeroAccounting(): AgentAccounting { return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }; }
-export function addAccounting(left: AgentAccounting, right: AgentAccounting): AgentAccounting { return { input: left.input + right.input, output: left.output + right.output, cacheRead: left.cacheRead + right.cacheRead, cacheWrite: left.cacheWrite + right.cacheWrite, cost: left.cost + right.cost }; }
-export function sumAccounting(values: Iterable<AgentAccounting>): AgentAccounting {
-  let total = zeroAccounting();
-  for (const value of values) total = addAccounting(total, value);
+export function addAccounting(left: AgentAccounting, right: AgentAccounting): AgentAccounting {
+  const cost = left.cost + right.cost;
+  const total: AgentAccounting = { input: left.input + right.input, output: left.output + right.output, cacheRead: left.cacheRead + right.cacheRead, cacheWrite: left.cacheWrite + right.cacheWrite, cost };
+  const a = left.costProvenance;
+  const b = right.costProvenance;
+  if (!a && !b) return total;
+  if (a?.status === "unknown") total.costProvenance = a;
+  else if (b?.status === "unknown") total.costProvenance = b;
+  else if (!a || !b) total.costProvenance = { status: "unknown", reason: "missing_provenance" };
+  else if (!Number.isFinite(a.usd + b.usd)) total.costProvenance = { status: "unknown", reason: "estimate_overflow" };
+  else total.costProvenance = { status: a.status === "pending" || b.status === "pending" ? "pending" : "estimated", usd: a.usd + b.usd };
   return total;
+}
+export function sumAccounting(values: Iterable<AgentAccounting>): AgentAccounting {
+  let total: AgentAccounting | undefined;
+  for (const value of values) total = total === undefined ? { ...value } : addAccounting(total, value);
+  return total ?? zeroAccounting();
 }
 export interface AgentSetupSummary { hookNames: readonly string[]; model: ModelSpec; tools: readonly string[]; cwd: string; resourceSelectors?: AgentResourceInspection }
 
@@ -204,7 +221,8 @@ export interface RunRecord {
   events?: readonly WorkflowRunEvent[];
   delivery?: WorkflowRunDelivery;
 }
-export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 5;
+export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 6;
+export const LEGACY_CHECKPOINT_IDENTITY_VERSION = 5;
 export type WorkflowLaunchMode = "foreground" | "background";
 export interface AgentDefinition { prompt?: string; description?: string; model?: string; thinking?: NonNullable<ModelSpec["thinking"]>; tools?: readonly string[]; skills?: readonly string[]; extensions?: readonly string[]; overrideSystemPrompt?: boolean; contextFiles?: readonly ContextFileScope[]; extensionSettings?: Readonly<WorkflowExtensionSettings> }
 export interface LaunchSnapshot {
@@ -242,7 +260,7 @@ type TypedWorkflowFunction<InputSchema extends TSchema, OutputSchema extends TSc
 type DefinedWorkflowFunction<InputSchema extends TSchema, OutputSchema extends TSchema, Run extends TypedWorkflowFunction<InputSchema, OutputSchema>["run"]> = Omit<TypedWorkflowFunction<InputSchema, OutputSchema>, "run"> & { run: Run };
 export function defineWorkflowFunction<InputSchema extends TSchema, OutputSchema extends TSchema, Run extends TypedWorkflowFunction<InputSchema, OutputSchema>["run"]>(workflowFunction: DefinedWorkflowFunction<InputSchema, OutputSchema, Run>): DefinedWorkflowFunction<InputSchema, OutputSchema, Run> { return workflowFunction; }
 export interface WorkflowAgentSessionReference { readonly transport: string; readonly sessionId: string; readonly locator?: JsonValue }
-export interface WorkflowAgentSessionStats { readonly tokens: { readonly input: number; readonly output: number; readonly cacheRead: number; readonly cacheWrite: number; readonly total: number }; readonly cost: number }
+export interface WorkflowAgentSessionStats { readonly tokens: { readonly input: number; readonly output: number; readonly cacheRead: number; readonly cacheWrite: number; readonly total: number }; readonly cost: number; readonly costProvenance?: CostProvenance }
 export interface WorkflowAgentMessage { readonly role: string; readonly content?: unknown; readonly stopReason?: string; readonly errorMessage?: string; readonly usage?: { readonly input: number; readonly output: number; readonly cacheRead: number; readonly cacheWrite: number; readonly cost: { readonly total: number } } }
 export interface WorkflowAgentSessionState { readonly model: ModelSpec; readonly thinking?: ModelSpec["thinking"]; readonly tools: readonly string[]; readonly systemPrompt?: string }
 export interface WorkflowAgentSessionEvent { readonly type: string; readonly state?: Readonly<WorkflowAgentSessionState>; readonly message?: WorkflowAgentMessage; readonly assistantMessageEvent?: { readonly type: string; readonly delta?: string }; readonly toolCallId?: string; readonly toolName?: string; readonly isError?: boolean }
@@ -321,7 +339,7 @@ export interface PreparedAgentSession {
   readonly settings?: Readonly<WorkflowExtensionSettings>;
 }
 export type AgentInspectionMode = "execution" | "inspection";
-export interface AgentTransportContext { readonly run: Readonly<WorkflowRunContext>; readonly identity: Readonly<AgentIdentity>; readonly attempt: number; readonly signal: AbortSignal; readonly tuiIndex?: number; readonly tuiLabel?: string; readonly settings: Readonly<WorkflowExtensionSettings> }
+export interface AgentTransportContext { readonly run: Readonly<WorkflowRunContext>; readonly identity: Readonly<AgentIdentity>; readonly attempt: number; readonly signal: AbortSignal; readonly tuiIndex?: number; readonly tuiLabel?: string; readonly settings: Readonly<WorkflowExtensionSettings>; readonly strictCost?: import("./strict-cost-openai.js").StrictCostSessionConfig }
 export interface AgentTransport { readonly id: string; createSession(prepared: Readonly<PreparedAgentSession>, context: Readonly<AgentTransportContext>): Promise<WorkflowAgentSession> }
 export interface AgentSetup { prompt: string; options: AgentOptions; sessionInput: SessionInput; prepared: Readonly<PreparedAgentSession>; transport: AgentTransport }
 export interface AgentSetupContext { readonly run: Readonly<WorkflowRunContext>; readonly identity: Readonly<AgentIdentity>; readonly attempt: number; readonly signal: AbortSignal; readonly tuiIndex?: number; readonly tuiLabel?: string; readonly mode?: AgentInspectionMode; readonly settings: Readonly<WorkflowExtensionSettings> }
@@ -359,8 +377,9 @@ export type CheckpointPolicy = CheckpointPolicyDecision | CheckpointPolicyHandle
 export interface FunctionIdentity { path: string; structuralPath: readonly string[]; occurrence: number; worktreeOwner?: string }
 export type AgentContinuity = "fresh" | "continued";
 export interface AgentIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; parentBreadcrumb?: string; worktreeOwner?: string; handle?: string; turn?: number }
+export interface CheckpointIdentity { structuralPath: readonly string[]; callSite: string; replaySafe: boolean; worktreeOwner?: string }
 export interface ShellIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; worktreeOwner?: string }
-export interface WorkflowBridge { agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>; shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>; checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>; function?: (name: string, input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: FunctionIdentity) => Promise<JsonValue>; worktree?: (owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>; functions?: Readonly<Record<string, { name: string }>>; phase?: (name: string) => void | Promise<void>; log?: (message: string) => void | Promise<void> }
+export interface WorkflowBridge { agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>; shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>; checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: CheckpointIdentity) => boolean | Promise<boolean>; function?: (name: string, input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: FunctionIdentity) => Promise<JsonValue>; worktree?: (owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>; functions?: Readonly<Record<string, { name: string }>>; phase?: (name: string) => void | Promise<void>; log?: (message: string) => void | Promise<void> }
 export interface WorkflowExecution { result: Promise<JsonValue>; cancel: () => void }
 export interface StaticWorkflowScope { kind: "parallel" | "pipeline"; name: string | null; key: string | null }
 export type StaticWorkflowExecution = "parallel" | "sequential";

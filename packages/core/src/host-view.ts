@@ -123,7 +123,7 @@ function phaseSummary(agents: readonly AgentRecord[], styles: WorkflowProgressSt
   const span = starts.length ? Math.max(...agents.map(agentEnd)) - Math.min(...starts) : 0;
   const accounting = sumAccounting(agents.map((agent) => agent.accounting ?? zeroAccounting()));
   const failed = count("failed");
-  const parts = [`${String(count("completed"))} done`, ...(failed ? [styles.error(`${String(failed)} failed`)] : []), ...(count("cancelled") ? [`${String(count("cancelled"))} cancelled`] : []), ...(span > 0 ? [formatWorkflowRuntime(span)] : []), formatTokens(accounting.input + accounting.output), formatCost(accounting.cost)].filter(Boolean);
+  const parts = [`${String(count("completed"))} done`, ...(failed ? [styles.error(`${String(failed)} failed`)] : []), ...(count("cancelled") ? [`${String(count("cancelled"))} cancelled`] : []), ...(span > 0 ? [formatWorkflowRuntime(span)] : []), formatTokens(accounting.input + accounting.output), formatCost(accounting.cost, accounting.costProvenance)].filter(Boolean);
   return styles.muted(parts.join(" · "));
 }
 /**
@@ -153,7 +153,7 @@ function workflowProgressLines(run: PersistedRun, spinner: string, styles: Workf
   const iconStyle = workflowIconStyle(run.state, styles);
   const header = styles.bold(styles.accent(`Workflow: ${run.workflowName} (${String(done)}/${String(run.agents.length)} done)`));
   const state = progressStyleForState(run.state, styles)(`[${run.state}]`);
-  const usageStats = run.usage ? [formatTokens(run.usage.tokens), formatCost(run.usage.costUsd)].filter(Boolean).join(" · ") : "";
+  const usageStats = run.usage ? [formatTokens(run.usage.tokens), formatCost(run.usage.costUsd, run.usage.costProvenance)].filter(Boolean).join(" · ") : "";
   const runtime = run.usage ? ` runtime=${formatWorkflowRuntime(run.usage.durationMs)}` : "";
   const lines = [`${iconStyle(workflowIcon)} ${header} ${state}${usageStats ? ` ${usageStats}` : ""}${runtime}`];
   const budgetWarning = run.state === "budget_exhausted" || (run.budgetEvents ?? []).some((event) => event.type === "hard_exhausted");
@@ -281,7 +281,7 @@ export function workflowControlCall(name: string, args: Record<string, unknown>,
   const runId = controlString(args.runId) ?? "(missing run ID)";
   if (name === "workflow_respond") {
     const proposalId = controlString(args.proposalId);
-    const target = proposalId ? `budget proposal ${proposalId}` : `checkpoint ${controlString(args.name) ?? "(missing name)"}`;
+    const target = proposalId ? `budget proposal ${proposalId}` : `checkpoint ${controlString(args.occurrenceId) ?? controlString(args.name) ?? "(missing selector)"}`;
     const decision = args.approved === true ? "approve" : "reject";
     return [`${controlTitle(name, theme)} ${theme.fg("accent", runId)}`, `${theme.fg("muted", target)} · ${controlAction(decision, theme)}`].join("\n");
   }
@@ -495,9 +495,17 @@ export function formatBudgetStatus(run: Pick<PersistedRun, "budget" | "budgetVer
     const limits = run.budget[dimension];
     if (!limits || (limits.soft === undefined && limits.hard === undefined)) continue;
     const limit = limits.hard ?? limits.soft;
-    const percent = limit === undefined ? "" : ` ${limit === 0 ? "100.0" : ((usage[dimension] / limit) * 100).toFixed(1)}%`;
+    const provenance = dimension === "costUsd" && run.budget.costUsd?.requireProvenance
+      ? usage.costProvenance ?? { status: "unknown", reason: "missing_provenance" }
+      : undefined;
+    const amount = provenance?.status === "unknown" ? `unknown (${provenance.reason})`
+      : provenance?.status === "pending" ? `pending (${String(provenance.usd)} settled)`
+      : String(provenance?.usd ?? usage[dimension]);
+    const percent = limit === undefined || provenance?.status === "unknown" || provenance?.status === "pending"
+      ? ""
+      : ` ${limit === 0 ? "100.0" : (((provenance?.usd ?? usage[dimension]) / limit) * 100).toFixed(1)}%`;
     const state = (run.budgetEvents ?? []).filter((event) => event.dimensions.includes(dimension)).at(-1)?.type;
-    lines.push(`  ${dimension}: ${String(usage[dimension])}${limits.soft !== undefined ? ` soft=${String(limits.soft)}` : ""}${limits.hard !== undefined ? ` hard=${String(limits.hard)}` : ""}${percent}${state ? ` state=${state}` : ""}`);
+    lines.push(`  ${dimension}: ${amount}${limits.soft !== undefined ? ` soft=${String(limits.soft)}` : ""}${limits.hard !== undefined ? ` hard=${String(limits.hard)}` : ""}${percent}${state ? ` state=${state}` : ""}`);
   }
   const events = run.budgetEvents ?? [];
   if (events.length) lines.push(`  events: ${events.map((event) => `${event.type}@v${String(event.budgetVersion)}`).join(", ")}`);
@@ -536,7 +544,7 @@ export function navigatorRunLabels(entries: readonly { store: RunStore; loaded: 
     const glyph = runStateGlyph(run.state, "⠦");
     const suffix = (nameCount.get(run.workflowName) ?? 0) > 1 ? ` ${store.runId.slice(0, 8)}` : "";
     const cost = run.agents.reduce((sum, a) => sum + (a.accounting?.cost ?? 0), 0);
-    const costStr = formatCost(cost);
+    const costStr = formatCost(cost, run.usage?.costProvenance);
     const runtime = run.usage ? ` runtime=${formatWorkflowRuntime(run.usage.durationMs)}` : "";
     return `${glyph} ${run.workflowName}${suffix}  ${run.state}  ${run.phase ?? ""}  ${String(done)}/${String(run.agents.length)} agents${costStr ? ` ${costStr}` : ""}${runtime}`;
   });
@@ -608,7 +616,7 @@ function formatWorkflowAgentDetail(agent: AgentRecord, now: number): string {
   return [
     `${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`,
     accounting ? formatTokens(accounting.input + accounting.output) : "",
-    accounting ? formatCost(accounting.cost) : "",
+    accounting ? formatCost(accounting.cost, accounting.costProvenance) : "",
     durationMs === undefined ? "" : formatWorkflowRuntime(durationMs),
     agent.attempts > 1 ? `attempt ${String(agent.attempts)}` : "",
   ].filter(Boolean).join(" · ");
@@ -701,7 +709,7 @@ export function visibleStandaloneAgentAttemptActions(actions: Readonly<Record<st
 
 function formatAgentAccounting(accounting: AgentAccounting): string[] {
   const total = accounting.input + accounting.output + accounting.cacheRead + accounting.cacheWrite;
-  return [`Tokens: ∑${formatAccountingValue(total)} ↑${formatAccountingValue(accounting.input)} ↓${formatAccountingValue(accounting.output)} ⇢${formatAccountingValue(accounting.cacheRead)} ⇠${formatAccountingValue(accounting.cacheWrite)}`, `Cost: ${formatCost(accounting.cost) || "$0.00"}`];
+  return [`Tokens: ∑${formatAccountingValue(total)} ↑${formatAccountingValue(accounting.input)} ↓${formatAccountingValue(accounting.output)} ⇢${formatAccountingValue(accounting.cacheRead)} ⇠${formatAccountingValue(accounting.cacheWrite)}`, `Cost: ${formatCost(accounting.cost, accounting.costProvenance) || "$0.00"}`];
 }
 
 export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[], now = Date.now()): string {
@@ -712,7 +720,7 @@ export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonl
   const glyph = runStateGlyph(run.state, "⠦");
   const header = `${glyph} ${run.workflowName}`;
   const runtime = run.usage ? `runtime=${formatWorkflowRuntime(run.usage.durationMs)}` : "";
-  const meta = [run.state, run.phase ? `phase: ${run.phase}` : "", `${String(done)}/${String(run.agents.length)} agents`, runtime, hasAccounting ? formatAccounting(totalAccounting) : "", formatCost(totalAccounting.cost)].filter(Boolean).join(" · ");
+  const meta = [run.state, run.phase ? `phase: ${run.phase}` : "", `${String(done)}/${String(run.agents.length)} agents`, runtime, hasAccounting ? formatAccounting(totalAccounting) : "", formatCost(totalAccounting.cost, run.usage?.costProvenance ?? totalAccounting.costProvenance)].filter(Boolean).join(" · ");
   const lines = [header, meta, ...formatCompactBudgetStatus(run)];
   const shellActivity = formatShellActivity(run.activeShells, run.activeShellStartedAt, "⠦", PLAIN_WORKFLOW_PROGRESS_STYLES, now);
   if (shellActivity) lines.push(`  ${shellActivity}`);
@@ -765,7 +773,7 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
     const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
     const role = agent.role ? ` role=${agent.role}` : "";
     const tools = ` tools=${agent.tools.join(",") || "(none)"}`;
-    const accounting = agent.accounting ? ` input=${String(agent.accounting.input)} output=${String(agent.accounting.output)} cache-read=${String(agent.accounting.cacheRead)} cache-write=${String(agent.accounting.cacheWrite)} cost=${formatCost(agent.accounting.cost) || "$0.00"}` : "";
+    const accounting = agent.accounting ? ` input=${String(agent.accounting.input)} output=${String(agent.accounting.output)} cache-read=${String(agent.accounting.cacheRead)} cache-write=${String(agent.accounting.cacheWrite)} cost=${formatCost(agent.accounting.cost, agent.accounting.costProvenance) || "$0.00"}` : "";
     const indent = "  ".repeat((grouped ? 2 : 1) + depth);
     const result = [`${indent}#${String(index + 1)} ${grouped ? agent.label ?? agent.name : agentBreadcrumb(agent, byId)} state=${agent.state} model=${model}${agent.requestedModel ? ` requested=${agent.requestedModel}` : ""}${role}${tools} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`];
     for (const attempt of agent.attemptDetails ?? []) result.push(`${indent}  attempt ${String(attempt.attempt)}${attempt.error ? ` error=${attempt.error.code}: ${attempt.error.message}` : ""}`);

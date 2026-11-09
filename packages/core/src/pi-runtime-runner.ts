@@ -53,7 +53,7 @@ function runtimeUsage(session: WorkflowAgentSession): RuntimeUsage {
   const stats = session.getSessionStats();
   const values = [stats.tokens.input, stats.tokens.output, stats.tokens.cacheRead, stats.tokens.cacheWrite, stats.cost];
   if (values.some((value) => !Number.isFinite(value))) return { availability: "unavailable" };
-  return { availability: "complete", input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, costUsd: stats.cost };
+  return { availability: "complete", input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, costUsd: stats.cost, ...(stats.costProvenance ? { costProvenance: stats.costProvenance } : {}) };
 }
 
 function providerFailure(session: WorkflowAgentSession, message: WorkflowAgentMessage | undefined): RuntimeAgentProviderFailure | undefined {
