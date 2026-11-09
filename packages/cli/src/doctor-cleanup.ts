@@ -3,7 +3,7 @@ import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { AGENT_STATES as CORE_AGENT_STATES, BUDGET_DIMENSIONS as CORE_BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES as CORE_BUDGET_EVENT_TYPES, HARD_TERMINAL_RUN_STATES, RUN_STATES, errorText, isNodeError, isThinkingLevel, jsonValue, object, validateBudget, validateModelAliases, validateSchema, type AgentState, type ModelSpec, type RunState } from "pi-extensible-workflows";
-import { acquireSessionLease, hasLiveSessionLease, json, projectSessionsDirectory, RunStore, type PersistedRun, type SessionLease } from "pi-extensible-workflows/persistence";
+import { acquireSessionLease, decodeJournal, hasLiveSessionLease, json, projectSessionsDirectory, RunStore, type PersistedRun, type SessionLease } from "pi-extensible-workflows/persistence";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REQUIRED_RUN_FILES = ["workflow.js", "state.json", "snapshot.json", "journal.json", "ownership.json", "worktrees.json", "borrowed-worktrees.json", "system-prompts.json"] as const;
@@ -162,7 +162,18 @@ function validateSnapshot(snapshot: unknown): void {
   if (snapshot.projectRoles !== undefined) stringList(snapshot.projectRoles, "Persisted snapshot project roles");
   for (const [index, schema] of snapshot.schemas.entries()) validateSchema(schema, `Persisted snapshot schema[${String(index)}]`);
 }
-function validateJournal(value: unknown): void { if (!object(value) || !object(value.completed) || (value.awaiting !== undefined && !object(value.awaiting)) || (value.decisions !== undefined && !object(value.decisions))) throw new Error("Persisted workflow journal is invalid"); for (const operation of Object.values(value.completed)) if (!object(operation) || typeof operation.path !== "string" || !operation.path || !jsonValue(operation.value)) throw new Error("Persisted completed operation is invalid"); for (const checkpoint of Object.values(value.awaiting ?? {})) if (!object(checkpoint) || typeof checkpoint.path !== "string" || !checkpoint.path || typeof checkpoint.name !== "string" || !checkpoint.name || typeof checkpoint.prompt !== "string" || !jsonValue(checkpoint.context)) throw new Error("Persisted awaiting checkpoint is invalid"); for (const decision of Object.values(value.decisions ?? {})) { if (!object(decision) || decision.kind !== "budget" || typeof decision.proposalId !== "string" || !decision.proposalId || typeof decision.runId !== "string" || !decision.runId || !object(decision.previous) || !object(decision.proposed) || !Number.isSafeInteger(decision.budgetVersion) || Number(decision.budgetVersion) < 1) throw new Error("Persisted budget decision is invalid"); validateUsage(decision.consumed, "Persisted budget decision usage"); validateBudget(decision.previous); validateBudget(decision.proposed); } }
+function validateJournal(value: unknown): void {
+  const journal = decodeJournal(value);
+  if (!journal) throw new Error("Persisted workflow journal is invalid");
+  for (const operation of Object.values(journal.completed)) if (!operation.path) throw new Error("Persisted completed operation is invalid");
+  for (const checkpoint of Object.values(journal.awaiting ?? {})) if (!checkpoint.path || !checkpoint.name) throw new Error("Persisted awaiting checkpoint is invalid");
+  for (const decision of Object.values(journal.decisions ?? {})) {
+    if (!decision.proposalId || !decision.runId || !Number.isSafeInteger(decision.budgetVersion) || decision.budgetVersion < 1) throw new Error("Persisted budget decision is invalid");
+    validateUsage(decision.consumed, "Persisted budget decision usage");
+    validateBudget(decision.previous);
+    validateBudget(decision.proposed);
+  }
+}
 async function validateSystemPrompts(store: RunStore): Promise<void> {
   const value = await json(store.systemPromptPath());
   if (object(value) && value.version === 2) { await store.systemPrompts(); return; }
@@ -225,7 +236,9 @@ async function scanSession(cwd: string, sessionId: string, home: string, expecte
   if (rootEntries.some((entry) => entry.name !== "runs")) throw new Error(`Session inventory contains an unrecognized entry: ${path}`);
   const runsPath = join(path, "runs");
   const before = await sessionEntries(runsPath);
-  const runEntries = before.filter((entry) => entry.name !== "owner.json");
+  const fence = before.find((entry) => entry.name === ".owner-acquisition");
+  if (fence && (!fence.isDirectory() || fence.isSymbolicLink())) throw new Error(`Session acquisition fence is not a regular directory: ${runsPath}`);
+  const runEntries = before.filter((entry) => entry.name !== "owner.json" && entry.name !== ".owner-acquisition");
   if (before.some((entry) => entry.name === "owner.json" && entry.isSymbolicLink())) throw new Error(`Session ownership lease is not a regular file: ${runsPath}`);
   for (const entry of runEntries) if (!entry.isDirectory() || entry.isSymbolicLink() || entry.name.startsWith(".")) throw new Error(`Session inventory contains an unrecognized entry: ${join(runsPath, entry.name)}`);
   const ownerPath = join(runsPath, "owner.json");
@@ -257,8 +270,8 @@ async function scanSession(cwd: string, sessionId: string, home: string, expecte
     } catch (error) { throw new Error(`Run ${runId} is corrupt or incomplete: ${errorText(error)}`, { cause: error }); }
   }
   const after = await sessionEntries(runsPath);
-  const beforeNames = before.map(({ name }) => name).sort();
-  const afterNames = after.map(({ name }) => name).sort();
+  const beforeNames = before.map(({ name }) => name).filter((name) => name !== ".owner-acquisition").sort();
+  const afterNames = after.map(({ name }) => name).filter((name) => name !== ".owner-acquisition").sort();
   if (!sameNames(beforeNames, afterNames)) throw new Error("Session inventory changed while scanning");
   const known = new Set(runs.map(({ runId }) => runId));
   for (const run of runs) for (const dependency of run.dependencies) if (!known.has(dependency)) throw new Error(`Run ${run.runId} depends on missing run ${dependency}`);

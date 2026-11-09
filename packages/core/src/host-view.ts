@@ -281,7 +281,7 @@ export function workflowControlCall(name: string, args: Record<string, unknown>,
   const runId = controlString(args.runId) ?? "(missing run ID)";
   if (name === "workflow_respond") {
     const proposalId = controlString(args.proposalId);
-    const target = proposalId ? `budget proposal ${proposalId}` : `checkpoint ${controlString(args.name) ?? "(missing name)"}`;
+    const target = proposalId ? `budget proposal ${proposalId}` : `checkpoint ${controlString(args.occurrenceId) ?? controlString(args.name) ?? "(missing selector)"}`;
     const decision = args.approved === true ? "approve" : "reject";
     return [`${controlTitle(name, theme)} ${theme.fg("accent", runId)}`, `${theme.fg("muted", target)} · ${controlAction(decision, theme)}`].join("\n");
   }

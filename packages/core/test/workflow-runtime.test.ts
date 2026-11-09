@@ -132,7 +132,7 @@ void test("launch snapshots are detached and deeply immutable", () => {
   input.roles.reviewer.prompt = "mutated";
   input.roles.reviewer.skills.push("mutated");
   assert.deepEqual(snapshot.args, { nested: [1] });
-  assert.equal(snapshot.identityVersion, 5);
+  assert.equal(snapshot.identityVersion, 6);
   assert.equal(snapshot.roles?.reviewer?.prompt, "original");
   assert.deepEqual(snapshot.roles.reviewer.skills, ["role-skill"]);
   assert.ok(Object.isFrozen(snapshot.args));

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { isDeepStrictEqual } from "node:util";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { HARD_TERMINAL_RUN_STATES, WorkflowError, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, loadLaunchSnapshot, object, positiveInteger, SerialLane } from "./utils.js";
@@ -9,12 +10,13 @@ import {
   decodeBooleanCheckpointResult, decodeBorrowedWorktreeBindings, decodeJournal, decodeLaunchSnapshot,
   decodeOwnershipRecords, decodePersistedRun, decodeSummaryProjection, decodeSystemPromptArtifact,
   decodeWorktreeReferences,
-  type AwaitingCheckpoint, type BorrowedWorktreeBinding, type CheckpointDecisionProvenance, type CompletedOperation, type EffectiveSystemPrompt,
+  type AwaitingCheckpoint, type BorrowedWorktreeBinding, type CheckpointDecisionProvenance, type CheckpointSelector, type CompletedOperation, type EffectiveSystemPrompt, type LiveCheckpoint,
   type Journal, type PendingWorkflowDecision, type PersistedOwnershipNode,
   type PersistedRun, type RunSummary, type RunSummaryArtifacts, type WorktreeReference,
 } from "./decoders.js";
 import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json } from "./io.js";
 import { runsDirectory, safePart, structuralPath } from "./paths.js";
+import { uniqueLegacyCheckpointNames } from "./validation.js";
 
 const SYSTEM_PROMPT_STORAGE = ".system-prompts";
 const SYSTEM_PROMPT_RECORDS = "records";
@@ -276,7 +278,10 @@ export class RunStore {
       const journal = await this.#decodeJournal();
       journal.awaiting ??= {};
       const result = await update(journal);
-      await atomicJson(join(this.directory, "journal.json"), journal);
+      // An array is intentionally incompatible with the legacy decoder, which could otherwise answer
+      // a versioned occurrence by its display name before checking the launch snapshot on resume.
+      const persisted = journal.checkpointVersion === 1 ? { ...journal, awaiting: Object.values(journal.awaiting ?? {}) } : journal;
+      await atomicJson(join(this.directory, "journal.json"), persisted);
       this.refreshSummaryBestEffort();
       return result;
     });
@@ -361,6 +366,63 @@ export class RunStore {
     });
   }
 
+  /** Legacy keys encode just one label. A numeric suffix can denote a repeat or a literal name. */
+  static isLegacyCheckpointPath(path: string): boolean { return /^checkpoint\/[^/]+$/.test(path); }
+  static isAmbiguousLegacyCheckpointName(name: string): boolean { return /#(?:[2-9]|[1-9][0-9]+)$/.test(name); }
+
+  async validateCheckpointHistory(seen = new Set<string>()): Promise<void> {
+    if (seen.has(this.runId)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance contains a cycle");
+    seen.add(this.runId);
+    const journal = await this.#readJournal();
+    const { run, snapshot } = await this.load();
+    if (journal.checkpointReplayBlocked) throw new WorkflowError("RESUME_INCOMPATIBLE", "Checkpoint order cannot be proven for recovery. Start a new run with direct checkpoint calls in separate named branches.");
+    const legacy = Object.values(journal.completed).filter(({ path }) => RunStore.isLegacyCheckpointPath(path));
+    const legacyNames = legacy.length ? uniqueLegacyCheckpointNames(snapshot.script) : new Set<string>();
+    if (legacy.some(({ path, checkpoint }) => !checkpoint || !legacyNames.has(checkpoint.name)
+        || RunStore.isAmbiguousLegacyCheckpointName(checkpoint.name) || path !== structuralPath("checkpoint", checkpoint.name))
+        || Object.values(journal.awaiting ?? {}).some(({ path, name }) => RunStore.isLegacyCheckpointPath(path) && RunStore.isAmbiguousLegacyCheckpointName(name))) {
+      throw new WorkflowError("RESUME_INCOMPATIBLE", "Historical checkpoint labels cannot be disambiguated. Start a new run for a fresh decision.");
+    }
+    if (run.retry?.sourceRunId) await (await this.sourceRun(run.retry.sourceRunId)).validateCheckpointHistory(seen);
+  }
+
+  /** A new execution only accepts the waits it actually reaches, with fresh response IDs. */
+  async supersedeCheckpointWaits(): Promise<void> {
+    await this.updateJournal((journal) => {
+      const awaiting = Object.values(journal.awaiting ?? {});
+      if (awaiting.length === 0) return;
+      journal.supersededCheckpointNames = [...new Set([...(journal.supersededCheckpointNames ?? []), ...awaiting.map(({ name }) => name)])];
+      journal.awaiting = {};
+      journal.checkpointVersion = 1;
+    });
+  }
+
+  async registerCheckpoint(checkpoint: AwaitingCheckpoint, legacyPath: string | undefined, unprovenReplay: boolean, canRegister: () => boolean): Promise<boolean | LiveCheckpoint> {
+    const replayed = await this.replay(checkpoint.path) ?? (legacyPath === undefined ? undefined : await this.replay(legacyPath));
+    const replayDecision = (operation: CompletedOperation): boolean => {
+      const result = decodeBooleanCheckpointResult(operation.value);
+      if (result === undefined || operation.checkpoint?.prompt !== checkpoint.prompt || !isDeepStrictEqual(operation.checkpoint.context, checkpoint.context)) {
+        throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted checkpoint does not match the current prompt and context");
+      }
+      return result;
+    };
+    return this.updateJournal((journal) => {
+      if (!canRegister()) throw new WorkflowError("CANCELLED", "Workflow cannot register a checkpoint after stopping");
+      const completed = journal.completed[checkpoint.path] ?? replayed;
+      if (completed) {
+        if (unprovenReplay) throw new WorkflowError("RESUME_INCOMPATIBLE", "Checkpoint order cannot be proven for recovery");
+        return replayDecision(completed);
+      }
+      const awaiting = journal.awaiting ?? (journal.awaiting = {});
+      if (awaiting[checkpoint.path]) throw new WorkflowError("RESUME_INCOMPATIBLE", "Checkpoint structural occurrence is already awaiting input");
+      const pending: LiveCheckpoint = { ...checkpoint, occurrenceId: randomUUID() };
+      awaiting[pending.path] = pending;
+      journal.checkpointVersion = 1;
+      if (unprovenReplay) journal.checkpointReplayBlocked = true;
+      return pending;
+    });
+  }
+
   async awaitingCheckpoints(): Promise<readonly AwaitingCheckpoint[]> {
     return Object.values((await this.#readJournal()).awaiting ?? {});
   }
@@ -380,10 +442,14 @@ export class RunStore {
     });
   }
 
-  async answerCheckpoint(name: string, approved: boolean, provenance?: CheckpointDecisionProvenance): Promise<AwaitingCheckpoint | undefined> {
+  async answerCheckpoint(selector: CheckpointSelector, approved: boolean, provenance?: CheckpointDecisionProvenance, owns?: (checkpoint: AwaitingCheckpoint) => boolean): Promise<AwaitingCheckpoint | undefined> {
     return this.updateJournal((journal) => {
-      const checkpoint = Object.values(journal.awaiting ?? {}).find((item) => item.name === name);
-      if (!checkpoint || journal.completed[checkpoint.path]) return undefined;
+      const byName = typeof selector === "string";
+      const matches = Object.values(journal.awaiting ?? {}).filter((item) => byName ? item.name === selector : item.occurrenceId === selector.occurrenceId);
+      const [checkpoint] = matches;
+      if (matches.length !== 1 || !checkpoint || journal.completed[checkpoint.path]) return undefined;
+      if (byName && (journal.supersededCheckpointNames?.includes(selector) || Object.values(journal.completed).some((item) => item.checkpoint?.name === selector))) return undefined;
+      if (checkpoint.occurrenceId !== undefined && !owns || owns && !owns(checkpoint)) return undefined;
       journal.completed[checkpoint.path] = {
         path: checkpoint.path,
         value: approved,
@@ -391,10 +457,11 @@ export class RunStore {
           name: checkpoint.name,
           prompt: checkpoint.prompt,
           context: checkpoint.context,
-          ...(provenance !== undefined ? { provenance } : {}),
+          ...(checkpoint.occurrenceId === undefined ? {} : { occurrenceId: checkpoint.occurrenceId }),
+          ...(provenance === undefined ? {} : { provenance }),
         },
       };
-      journal.awaiting = Object.fromEntries(Object.entries(journal.awaiting ?? {}).filter(([path]) => path !== checkpoint.path));
+      delete journal.awaiting?.[checkpoint.path];
       return checkpoint;
     });
   }

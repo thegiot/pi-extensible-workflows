@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AgentAttempt } from "./agent-execution.js";
-import type { AgentIdentity, AgentAttemptSummary, FunctionIdentity, JsonValue, ShellIdentity, ShellOptions, ShellResult, WorkflowAgentSessionReference, WorkflowBridge, WorkflowErrorCode, WorkflowExecution } from "./types.js";
+import type { AgentIdentity, AgentAttemptSummary, CheckpointIdentity, FunctionIdentity, JsonValue, ShellIdentity, ShellOptions, ShellResult, WorkflowAgentSessionReference, WorkflowBridge, WorkflowErrorCode, WorkflowExecution } from "./types.js";
 import { WorkflowError, roleNameOf, sumAccounting, zeroAccounting } from "./types.js";
 import { asWorkflowError, errorText, fail, isWorkflowAuthored, isWorkflowErrorCode, jsonValue, markWorkflowAuthored, object, positiveInteger } from "./utils.js";
 import { instrumentWorkflow, validateAgentOptions, validateShellCommand, validateShellOptions } from "./validation.js";
@@ -105,6 +105,7 @@ const named = (value, kind) => { if (typeof value !== "string" || !value.trim())
 // full path, so it is passed through untouched: feeding it here would encode its separators again.
 const path = (...names) => names.map(encodeURIComponent).join("/");
 const inheritedAgentPath = new AsyncLocalStorage();
+const inheritedCheckpointScopes = new AsyncLocalStorage();
 const agentOccurrences = new Map();
 const agentInflight = new Set();
 const shellOccurrences = new Map();
@@ -256,7 +257,12 @@ const prompt = (template, values) => {
   for (const key of keys) promptProperty(values, key, key, new Set());
   return template.replace(/{{|}}|{([A-Za-z_$][\w$]*)}/g, (match, key) => match === "{{" ? "{" : match === "}}" ? "}" : typeof values[key] === "string" ? values[key] : JSON.stringify(values[key], null, 2));
 };
-const checkpoint = input => rpc("checkpoint", [input]).then(unwrap);
+const checkpointAt = (input, callSite, depth) => {
+  const structuralPath = inheritedCheckpointScopes.getStore() || [];
+  return rpc("checkpoint", [input, { structuralPath, callSite, replaySafe: depth === structuralPath.length, worktreeOwner: worktreeOwners.getStore() }]).then(unwrap);
+};
+const checkpoint = input => checkpointAt(input, "indirect", null);
+const internalCheckpoint = (callee, callSite, depth) => callee === checkpoint ? input => checkpointAt(input, callSite, depth) : callee;
 const phase = name => rpc("phase", [name]);
 const log = message => rpc("log", [message]);
 const functionOccurrences = new Map();
@@ -292,7 +298,9 @@ const parallel = async (operationName, tasks) => {
     // inner names become indistinguishable in diagnostics and retry provenance.
     const parent = inheritedAgentPath.getStore() || [];
     try {
-      return { name, ok: true, value: await inheritedAgentPath.run([...parent, operationName, name], run) };
+      const scopes = inheritedCheckpointScopes.getStore() || [];
+      const branch = () => inheritedCheckpointScopes.run([...scopes, JSON.stringify(["parallel", operationName, name])], run);
+      return { name, ok: true, value: await inheritedAgentPath.run([...parent, operationName, name], branch) };
     } catch (error) {
       if (errorCode(error) === "CANCELLED") throw error;
       const failedAt = error && typeof error === "object" && typeof error.failedAt === "string" ? error.failedAt : undefined;
@@ -321,7 +329,9 @@ const pipeline = async (operationName, items, stages) => {
     try {
       for (const [stageName, run] of stageEntries) {
         failedAt = path(...parent, operationName, name, stageName);
-        value = await inheritedAgentPath.run([...parent, operationName, name, stageName], () => run(value));
+        const scopes = inheritedCheckpointScopes.getStore() || [];
+        const stage = () => inheritedCheckpointScopes.run([...scopes, JSON.stringify(["pipeline", operationName, name, stageName])], () => run(value));
+        value = await inheritedAgentPath.run([...parent, operationName, name, stageName], stage);
       }
       return { name, ok: true, value };
     } catch (error) {
@@ -340,7 +350,7 @@ for (const [name, fn] of Object.entries(functions)) Object.defineProperty(sandbo
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
 const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
 const body = config.script;
-Promise.resolve().then(() => new vm.Script("(async(__pi_extensible_workflows_agent,__pi_extensible_workflows_withWorktree,__pi_extensible_workflows_shell)=>{" + body + "\n})", { filename: "workflow.js" }).runInContext(context)(internalAgent, internalWithWorktree, internalShell))
+Promise.resolve().then(() => new vm.Script("(async(__pi_extensible_workflows_agent,__pi_extensible_workflows_withWorktree,__pi_extensible_workflows_shell,__pi_extensible_workflows_checkpoint)=>{" + body + "\n})", { filename: "workflow.js" }).runInContext(context)(internalAgent, internalWithWorktree, internalShell, internalCheckpoint))
   .then(async value => { await Promise.all(inflight); send({ type: "result", value: value === undefined ? null : value }); })
   .catch(error => send({ type: "error", error: workerError(error) }))
   .finally(() => clearInterval(heartbeat));
@@ -379,6 +389,11 @@ function readFunctionIdentity(value: unknown): FunctionIdentity {
   const worktreeOwner = value.worktreeOwner;
   if (typeof path !== "string" || !path || !Array.isArray(structuralPath) || !structuralPath.every((part): part is string => typeof part === "string" && Boolean(part.trim())) || !positiveInteger(occurrence) || worktreeOwner !== undefined && (typeof worktreeOwner !== "string" || !worktreeOwner)) fail("INTERNAL_ERROR", "Invalid workflow function identity");
   return { path, structuralPath: [...structuralPath], occurrence, ...(typeof worktreeOwner === "string" ? { worktreeOwner } : {}) };
+}
+function readCheckpointIdentity(value: unknown): CheckpointIdentity {
+  if (!object(value) || typeof value.replaySafe !== "boolean") fail("INTERNAL_ERROR", "Invalid workflow checkpoint identity");
+  const { structuralPath, callSite, worktreeOwner } = readAgentIdentity({ ...value, occurrence: 1 });
+  return { structuralPath, callSite, replaySafe: value.replaySafe, ...(worktreeOwner === undefined ? {} : { worktreeOwner }) };
 }
 function readShellIdentity(value: unknown): ShellIdentity {
   const identity = readAgentIdentity(value);
@@ -573,7 +588,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         if (!bridge.checkpoint || !object(values[0])) fail("INTERNAL_ERROR", "checkpoint requires an available bridge and object input");
         const name = typeof values[0].name === "string" ? values[0].name : "checkpoint";
         try {
-          const result = await bridge.checkpoint(values[0], controller.signal);
+          const result = await bridge.checkpoint(values[0], controller.signal, readCheckpointIdentity(values[1]));
           if (typeof result !== "boolean") fail("INTERNAL_ERROR", "checkpoint must return a boolean");
           value = branded({ name, ok: true, value: result ? "approved" : "rejected" });
         } catch (error) {

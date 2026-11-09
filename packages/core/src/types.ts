@@ -83,7 +83,7 @@ export interface WorkflowRunFailedEvent extends WorkflowEventBase { error: Workf
 export interface WorkflowAgentStateChangedEvent extends WorkflowEventBase { agentId: string; displayLabel: string; role?: string; structuralPath: readonly string[]; parentId?: string; parentBreadcrumb?: string; worktreeOwner?: string; previousState?: AgentState; state: AgentState; attempt: number }
 export interface WorkflowPhaseChangedEvent extends WorkflowEventBase { previousPhase?: string; phase: string }
 export type WorkflowCheckpointState = "awaiting" | "approved" | "rejected";
-export interface WorkflowCheckpointStateChangedEvent extends WorkflowEventBase { name: string; state: WorkflowCheckpointState }
+export interface WorkflowCheckpointStateChangedEvent extends WorkflowEventBase { name: string; state: WorkflowCheckpointState; occurrenceId?: string }
 export interface WorkflowBudgetEvent extends WorkflowEventBase { type: BudgetEventType; budgetVersion: number; dimensions: readonly BudgetDimension[]; usage: WorkflowBudgetUsage; limits: WorkflowBudget; proposalId?: string; previous?: WorkflowBudget; proposed?: WorkflowBudget }
 export interface ModelSpec { provider: string; model: string; thinking?: ThinkingLevel }
 export interface WorkflowModelAliasResolverContext { cwd: string; projectTrusted: boolean; rootModel: ModelSpec; knownModels: ReadonlySet<string>; availableModels: ReadonlySet<string>; signal: AbortSignal }
@@ -204,7 +204,8 @@ export interface RunRecord {
   events?: readonly WorkflowRunEvent[];
   delivery?: WorkflowRunDelivery;
 }
-export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 5;
+export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 6;
+export const LEGACY_CHECKPOINT_IDENTITY_VERSION = 5;
 export type WorkflowLaunchMode = "foreground" | "background";
 export interface AgentDefinition { prompt?: string; description?: string; model?: string; thinking?: NonNullable<ModelSpec["thinking"]>; tools?: readonly string[]; skills?: readonly string[]; extensions?: readonly string[]; overrideSystemPrompt?: boolean; contextFiles?: readonly ContextFileScope[]; extensionSettings?: Readonly<WorkflowExtensionSettings> }
 export interface LaunchSnapshot {
@@ -359,8 +360,9 @@ export type CheckpointPolicy = CheckpointPolicyDecision | CheckpointPolicyHandle
 export interface FunctionIdentity { path: string; structuralPath: readonly string[]; occurrence: number; worktreeOwner?: string }
 export type AgentContinuity = "fresh" | "continued";
 export interface AgentIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; parentBreadcrumb?: string; worktreeOwner?: string; handle?: string; turn?: number }
+export interface CheckpointIdentity { structuralPath: readonly string[]; callSite: string; replaySafe: boolean; worktreeOwner?: string }
 export interface ShellIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; worktreeOwner?: string }
-export interface WorkflowBridge { agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>; shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>; checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>; function?: (name: string, input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: FunctionIdentity) => Promise<JsonValue>; worktree?: (owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>; functions?: Readonly<Record<string, { name: string }>>; phase?: (name: string) => void | Promise<void>; log?: (message: string) => void | Promise<void> }
+export interface WorkflowBridge { agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>; shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>; checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: CheckpointIdentity) => boolean | Promise<boolean>; function?: (name: string, input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: FunctionIdentity) => Promise<JsonValue>; worktree?: (owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>; functions?: Readonly<Record<string, { name: string }>>; phase?: (name: string) => void | Promise<void>; log?: (message: string) => void | Promise<void> }
 export interface WorkflowExecution { result: Promise<JsonValue>; cancel: () => void }
 export interface StaticWorkflowScope { kind: "parallel" | "pipeline"; name: string | null; key: string | null }
 export type StaticWorkflowExecution = "parallel" | "sequential";
