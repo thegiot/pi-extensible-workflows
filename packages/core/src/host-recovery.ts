@@ -118,14 +118,13 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     return { hasUI: host?.hasUI === true, ui };
   };
   type ColdResumeResult = { value: JsonValue; resultPath: string; resultBytes: number; completion: CompletionDeliveryResult };
-  const coldResumeRun = async (run: WorkflowRunRecord, hasUI: boolean, ui: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, trustedProject: boolean, context?: { model: { provider: string; id: string } | undefined; modelRegistry: WorkflowRecoveryContext["modelRegistry"]; deliveryContext: CompletionDeliveryContext; signal?: AbortSignal | undefined; resolvedAliases?: Readonly<Record<string, string>>; blockedAliases?: ReadonlySet<string>; blockedAliasTargets?: Readonly<Record<string, string>> }, modeOverride?: boolean, waitForCompletion = true): Promise<ColdResumeResult | undefined> => {
+  const coldResumeRunUnlocked = async (run: WorkflowRunRecord, hasUI: boolean, ui: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, trustedProject: boolean, context?: { model: { provider: string; id: string } | undefined; modelRegistry: WorkflowRecoveryContext["modelRegistry"]; deliveryContext: CompletionDeliveryContext; signal?: AbortSignal | undefined; resolvedAliases?: Readonly<Record<string, string>>; blockedAliases?: ReadonlySet<string>; blockedAliasTargets?: Readonly<Record<string, string>> }, modeOverride?: boolean, waitForCompletion = true): Promise<ColdResumeResult | undefined> => {
     const loaded = await run.store.load();
     const foreground = modeOverride ?? (loaded.run.delivery?.mode === "foreground" || (loaded.run.delivery?.mode === "background" && loaded.run.delivery.toolCallId !== undefined) || (loaded.run.delivery === undefined && loaded.snapshot.launchMode === "foreground"));
     if (loaded.run.activeShells !== undefined || loaded.run.activeShellStartedAt !== undefined || loaded.run.activeShellsByPhase !== undefined) await persistRunState(run.store, run.metadata, withoutActiveShells);
     await run.store.validateRetrySource();
     await run.store.validateBorrowedWorktrees();
     assertResumableSnapshot(loaded.snapshot, trustedProject);
-    await run.store.validateCheckpointHistory();
     const rootModel = context?.model ? { ...run.model, provider: context.model.provider, model: context.model.id } : run.model;
     const controller = new AbortController();
     if (context?.signal?.aborted) controller.abort(); else { context?.signal?.addEventListener("abort", () => { controller.abort(); }, { once: true }); }
@@ -134,7 +133,10 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     if (!script) throw new WorkflowError("INTERNAL_ERROR", "Resume preflight did not produce a launch script");
     const persistedSnapshot = createLaunchSnapshot({ ...snapshot, identityVersion: LAUNCH_SNAPSHOT_IDENTITY_VERSION, ...(modeOverride === undefined ? {} : { launchMode: foreground ? "foreground" : "background" }) });
     await run.lifecycle.checkpointMutation(async () => {
-      if (!isExternallyEndedRunState(run.lifecycle.state) || controller.signal.aborted) throw new WorkflowError("CANCELLED", "Workflow recovery is no longer active");
+      if (run.lifecycle.state !== "interrupted" && run.lifecycle.state !== "budget_exhausted" || controller.signal.aborted) throw new WorkflowError("CANCELLED", "Workflow recovery is no longer active");
+      // An interrupted legacy wait can still receive a name-based response. Validate its history
+      // before superseding the waits while holding the same lock as response consumption.
+      await run.store.validateCheckpointHistory();
       await run.store.supersedeCheckpointWaits();
       await run.store.saveSnapshot(persistedSnapshot);
     });
@@ -193,6 +195,15 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
       throw error;
     }
   };
+  const coldResumeClaims = new Set<WorkflowRunRecord>();
+  const coldResumeRun = async (...args: Parameters<typeof coldResumeRunUnlocked>): Promise<ColdResumeResult | undefined> => {
+    const [run] = args;
+    if (coldResumeClaims.has(run)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow recovery is already in progress");
+    coldResumeClaims.add(run);
+    try { return await coldResumeRunUnlocked(...args); }
+    finally { coldResumeClaims.delete(run); }
+  };
+
   const applyBudgetDecision = async (request: BudgetApprovalRequest, approved: boolean, context?: unknown, signal?: AbortSignal, waitForCompletion = true): Promise<BudgetDecisionResult> => {
     const run = runs.get(request.runId);
     if (!run) throw new WorkflowError("RESUME_INCOMPATIBLE", `Unknown workflow run: ${request.runId}`);

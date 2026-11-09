@@ -192,6 +192,30 @@ void test("legacy unique answers replay and ambiguous suffixed history blocks re
   await waitForState(ambiguous, "interrupted");
 });
 
+void test("cold resume supersedes a legacy wait before admitting a concurrent response", async (t) => {
+  const host = await fixture(t);
+  const store = host.store("legacy");
+  const metadata = { name: "legacy-gate" };
+  const script = "return checkpoint({name:'gate',prompt:'gate',context:null});";
+  await store.create({ id: store.runId, sessionId: "session", cwd: store.cwd, workflowName: metadata.name, state: "interrupted", agents: [], agentSessions: [] },
+    createLaunchSnapshot({ identityVersion: 5, args: null, script, metadata, models: [], tools: [], agentTypes: [], roles: {}, schemas: [], settings: { concurrency: 1 } }));
+  await store.awaitCheckpoint({ path: "checkpoint/gate", name: "gate", prompt: "gate", context: null });
+  await host.start();
+  let concurrent: Promise<ControlResult> | undefined;
+  const validate = Object.getOwnPropertyDescriptor(RunStore.prototype, "validateCheckpointHistory")?.value as RunStore["validateCheckpointHistory"];
+  t.mock.method(RunStore.prototype, "validateCheckpointHistory", async function (this: RunStore) {
+    await validate.call(this);
+    concurrent ??= host.execute("workflow_respond", { runId: store.runId, name: "gate", approved: true });
+  });
+  await host.resume(store.runId);
+  assert.ok(concurrent);
+  assert.equal((await concurrent).details.accepted, false);
+  const { occurrenceId } = await pending(store, "gate");
+  assert.equal((await host.execute("workflow_respond", { runId: store.runId, occurrenceId, approved: false })).details.accepted, true);
+  await waitForState(store, "completed");
+  assert.equal(JSON.parse(await readFile(join(store.directory, "result.json"), "utf8")), "rejected");
+});
+
 void test("same-site concurrent occurrences get separate decisions and block ambiguous retry", async (t) => {
   const host = await fixture(t);
   const store = await host.launch(`await Promise.all([1, 2].map(() => checkpoint({name:'gate',prompt:'same',context:null})));
